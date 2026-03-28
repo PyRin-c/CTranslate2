@@ -14,5 +14,6 @@ from ctranslate2.specs.transformer_spec import (
     TransformerSpec,
 )
 from ctranslate2.specs.wav2vec2_spec import Wav2Vec2Spec
+from ctranslate2.specs.conformer_spec import ParakeetModelSpec
 from ctranslate2.specs.wav2vec2bert_spec import Wav2Vec2BertSpec
 from ctranslate2.specs.whisper_spec import WhisperSpec

@@ -11,19 +11,18 @@ for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio
 )
 
 if not defined VS_INSTALL_DIR (
-  echo ERROR: Visual Studio not found >> %LOGFILE%
+  echo ERROR: Visual Studio not found
   exit /b 1
 )
 
-call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 >> %LOGFILE% 2>&1
-echo [2] MSVC done >> %LOGFILE%
+call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64
+echo [2] MSVC done
 
 set CTRANSLATE2_ROOT=%SCRIPT_DIR%..\build\install
-echo [3] CTRANSLATE2_ROOT=%CTRANSLATE2_ROOT% >> %LOGFILE%
-
+echo [3] CTRANSLATE2_ROOT=%CTRANSLATE2_ROOT%
 cd /d %SCRIPT_DIR%
-echo [4] Running uv build... >> %LOGFILE%
-uv build --wheel --no-build-isolation >> %LOGFILE% 2>&1
-echo [5] Exit code: %ERRORLEVEL% >> %LOGFILE%
+echo [4] Running uv build...
+uv build --wheel --no-build-isolation
+echo [5] Exit code: %ERRORLEVEL%
 
 endlocal

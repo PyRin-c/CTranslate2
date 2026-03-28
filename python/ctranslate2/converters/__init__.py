@@ -1,5 +1,6 @@
 from ctranslate2.converters.converter import Converter
 from ctranslate2.converters.fairseq import FairseqConverter
+from ctranslate2.converters.nemo_parakeet import NemoParakeetConverter
 from ctranslate2.converters.marian import MarianConverter
 from ctranslate2.converters.openai_gpt2 import OpenAIGPT2Converter
 from ctranslate2.converters.opennmt_py import OpenNMTPyConverter

@@ -204,7 +204,9 @@ namespace ctranslate2 {
           if (is_quantizable(name)) {
             auto variable_weight_dtype = weight_dtype;
             // For conv layer, we need to reshape to ensure dtype as its weights are 3D.
-            auto is_conv = name.find("conv") != std::string::npos;
+            // Only treat as conv1d weight if rank == 3; rank-2 weights inside conv
+            // modules (e.g. pointwise_conv stored as Linear) must not be reshaped.
+            auto is_conv = name.find("conv") != std::string::npos && variable.rank() == 3;
             auto kernel_size = -1;
             if (is_conv) {
               kernel_size = variable.dim(2);

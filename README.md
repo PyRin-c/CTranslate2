@@ -30,8 +30,8 @@ All core functionality and performance optimizations are the work of the upstrea
 * A repository was needed that addresses the process crash on model unload in Windows environments, a known issue reported in Faster-Whisper and the upstream CTranslate2.  
   Windows 環境における model アンロード時のプロセスクラッシュ問題（Faster-Whisper および CTranslate2 本家で報告済み）に対応したリポジトリが必要であったこと。
 
-* When using multiple ASR models, there are few mature projects with multi-model support comparable to llama.cpp or vllm.  
-  複数の ASR モデルを使用する際に、llama.cpp や vllm のような複数モデルサポートの成熟したプロジェクトが少ないこと。
+* When managing multiple ASR models simultaneously, there are few mature solutions with multi-model support comparable to what llama.cpp or vllm offer for LLM inference.  
+  複数の ASR モデルを同時に管理する際に、LLM 推論における llama.cpp や vllm のような複数モデルサポートを備えた成熟したソリューションが少ないこと。
 
 * Attempting to use Whisper Large v3 via ONNX was blocked by the protobuf 2 GB limit, making Faster-Whisper the continued candidate of choice.  
   ONNX で Whisper Large v3 を使おうとした際に protobuf の 2GB 問題で変換が行えず、必然的に Faster-Whisper が引き続き候補であること。
@@ -49,7 +49,8 @@ The project implements a custom runtime that applies many performance optimizati
 
 The following model types are currently supported:
 
-* Encoder-decoder models: Transformer base/big, M2M-100, NLLB, BART, mBART, Pegasus, T5, Whisper T5Gemma
+* Encoder-decoder models: Transformer base/big, M2M-100, NLLB, BART, mBART, Pegasus, T5, Whisper, T5Gemma
+* CTC models: Parakeet-CTC
 * Decoder-only models: GPT-2, GPT-J, GPT-NeoX, OPT, BLOOM, MPT, Llama, Mistral, Gemma, CodeGen, GPTBigCode, Falcon, Qwen2
 * Encoder-only models: BERT, DistilBERT, XLM-RoBERTa
 

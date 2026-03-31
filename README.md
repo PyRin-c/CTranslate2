@@ -1,5 +1,46 @@
 [![CI](https://github.com/OpenNMT/CTranslate2/workflows/CI/badge.svg)](https://github.com/OpenNMT/CTranslate2/actions?query=workflow%3ACI) [![PyPI version](https://badge.fury.io/py/ctranslate2.svg)](https://badge.fury.io/py/ctranslate2) [![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://opennmt.net/CTranslate2/) [![Gitter](https://badges.gitter.im/OpenNMT/CTranslate2.svg)](https://gitter.im/OpenNMT/CTranslate2?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge) [![Forum](https://img.shields.io/discourse/status?server=https%3A%2F%2Fforum.opennmt.net%2F)](https://forum.opennmt.net/)
 
+> **Note: This is a fork of [OpenNMT/CTranslate2](https://github.com/OpenNMT/CTranslate2), maintained by [PyRin-c](https://github.com/PyRin-c).**  
+> **注意: このリポジトリは [OpenNMT/CTranslate2](https://github.com/OpenNMT/CTranslate2) のフォークであり、[PyRin-c](https://github.com/PyRin-c) が管理しています。**
+>
+> This fork is intended for experimental implementation of new model architectures and PoC implementation of new quantization methods on top of the upstream project.  
+> このフォークは上流プロジェクトを基盤に、新モデルアーキテクチャの実験的実装および新量子化手法の PoC 実装を目的としています。
+>
+> For the original project, please refer to the upstream repository.  
+> 元のプロジェクトについては、上流リポジトリをご参照ください。
+>
+> This fork exists solely to add features not yet available in the upstream project. If the upstream project incorporates these features, this repository may be deprecated and archived.  
+> このフォークは上流プロジェクトにまだ存在しない機能を追加する目的のみで作成されています。上流プロジェクトが同等の機能を取り込んだ場合、このリポジトリは廃棄・アーカイブされる可能性があります。
+
+---
+
+### Acknowledgments / 謝辞
+
+This repository is a fork of [OpenNMT/CTranslate2](https://github.com/OpenNMT/CTranslate2), maintained by [PyRin-c](https://github.com/PyRin-c).  
+このリポジトリは [OpenNMT/CTranslate2](https://github.com/OpenNMT/CTranslate2) のフォークであり、[PyRin-c](https://github.com/PyRin-c) が管理しています。
+
+We are deeply grateful to the original authors and contributors of CTranslate2 and the [OpenNMT](https://opennmt.net/) project for creating and maintaining this excellent inference engine. Without their foundational work, this fork would not exist.  
+CTranslate2 および [OpenNMT](https://opennmt.net/) プロジェクトの原著者・コントリビューターの皆様が、この優れた推論エンジンを作成・維持してくださっていることに深く感謝いたします。皆様の基盤なしにこのフォークは存在し得ませんでした。
+
+All core functionality and performance optimizations are the work of the upstream CTranslate2 team. This fork only adds experimental features such as new model architectures and PoC quantization methods on top of the original codebase.  
+コア機能およびパフォーマンス最適化はすべて上流の CTranslate2 チームによる成果です。このフォークは元のコードベースに対して、新モデルアーキテクチャの実験的実装や量子化手法の PoC といった追加機能を加えたものに過ぎません。
+
+### Motivation / このフォークの動機
+
+* A repository was needed that addresses the process crash on model unload in Windows environments, a known issue reported in Faster-Whisper and the upstream CTranslate2.  
+  Windows 環境における model アンロード時のプロセスクラッシュ問題（Faster-Whisper および CTranslate2 本家で報告済み）に対応したリポジトリが必要であったこと。
+
+* When managing multiple ASR models simultaneously, there are few mature solutions with multi-model support comparable to what llama.cpp or vllm offer for LLM inference.  
+  複数の ASR モデルを同時に管理する際に、LLM 推論における llama.cpp や vllm のような複数モデルサポートを備えた成熟したソリューションが少ないこと。
+
+* Attempting to use Whisper Large v3 via ONNX was blocked by the protobuf 2 GB limit, making Faster-Whisper the continued candidate of choice.  
+  ONNX で Whisper Large v3 を使おうとした際に protobuf の 2GB 問題で変換が行えず、必然的に Faster-Whisper が引き続き候補であること。
+
+* A personal learning aspect — adding new models while studying model architectures in depth.  
+  モデルの構造を学びながら新しいモデルを追加したいという学習的な側面もあること。
+
+---
+
 # CTranslate2
 
 CTranslate2 is a C++ and Python library for efficient inference with Transformer models.
@@ -8,7 +49,8 @@ The project implements a custom runtime that applies many performance optimizati
 
 The following model types are currently supported:
 
-* Encoder-decoder models: Transformer base/big, M2M-100, NLLB, BART, mBART, Pegasus, T5, Whisper T5Gemma
+* Encoder-decoder models: Transformer base/big, M2M-100, NLLB, BART, mBART, Pegasus, T5, Whisper, T5Gemma
+* CTC models: Parakeet-CTC
 * Decoder-only models: GPT-2, GPT-J, GPT-NeoX, OPT, BLOOM, MPT, Llama, Mistral, Gemma, CodeGen, GPTBigCode, Falcon, Qwen2
 * Encoder-only models: BERT, DistilBERT, XLM-RoBERTa
 
@@ -136,3 +178,4 @@ Check out our [Contributing Guide](CONTRIBUTING.md) to learn how to set up your 
 * [Documentation](https://opennmt.net/CTranslate2)
 * [Forum](https://forum.opennmt.net)
 * [Gitter](https://gitter.im/OpenNMT/CTranslate2)
+

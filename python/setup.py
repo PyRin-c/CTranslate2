@@ -24,6 +24,12 @@ def _maybe_add_library_root(lib_name):
 
 _maybe_add_library_root("CTRANSLATE2")
 
+# Allow overriding include/lib dirs independently (useful for split source/build trees)
+if "CTRANSLATE2_INCLUDE_DIR" in os.environ:
+    include_dirs.append(os.environ["CTRANSLATE2_INCLUDE_DIR"])
+if "CTRANSLATE2_LIB_DIR" in os.environ:
+    library_dirs.append(os.environ["CTRANSLATE2_LIB_DIR"])
+
 cflags = ["-std=c++17", "-fvisibility=hidden"]
 ldflags = []
 package_data = {}

@@ -136,6 +136,7 @@ set(SOURCES
   src/layers/common.cc
   src/layers/decoder.cc
   src/layers/transformer.cc
+  src/layers/conformer.cc
   src/layers/wav2vec2.cc
   src/layers/wav2vec2bert.cc
   src/layers/whisper.cc
@@ -146,6 +147,7 @@ set(SOURCES
   src/models/model_reader.cc
   src/models/sequence_to_sequence.cc
   src/models/transformer.cc
+  src/models/parakeet.cc
   src/models/wav2vec2.cc
   src/models/wav2vec2bert.cc
   src/models/whisper.cc
@@ -159,6 +161,10 @@ set(SOURCES
   src/ops/concat_split_slide_cpu.cc
   src/ops/conv1d.cc
   src/ops/conv1d_cpu.cc
+  src/ops/conv2d.cc
+  src/ops/conv2d_cpu.cc
+  src/ops/rel_shift.cc
+  src/ops/rel_shift_cpu.cc
   src/ops/cos.cc
   src/ops/dequantize.cc
   src/ops/dequantize_cpu.cc
@@ -240,6 +246,7 @@ set(CUDA_SOURCES
   src/ops/bias_add_gpu.cu
   src/ops/concat_split_slide_gpu.cu
   src/ops/conv1d_gpu.cu
+  src/ops/conv2d_gpu.cu
   src/ops/dequantize_gpu.cu
   src/ops/flash_attention_gpu.cu
   src/ops/gather_gpu.cu
@@ -248,6 +255,7 @@ set(CUDA_SOURCES
   src/ops/mean_gpu.cu
   src/ops/median_filter_gpu.cu
   src/ops/multinomial_gpu.cu
+  src/ops/rel_shift_gpu.cu
   src/ops/rms_norm_gpu.cu
   src/ops/rotary_gpu.cu
   src/ops/softmax_gpu.cu
@@ -604,6 +612,8 @@ if (WITH_CUDA)
     add_definitions(-DCT2_WITH_CUDNN)
     list(APPEND CUDA_SOURCES src/ops/conv1d_cudnn_gpu.cu)
     list(REMOVE_ITEM CUDA_SOURCES src/ops/conv1d_gpu.cu)
+    list(APPEND CUDA_SOURCES src/ops/conv2d_cudnn_gpu.cu)
+    list(REMOVE_ITEM CUDA_SOURCES src/ops/conv2d_gpu.cu)
   endif()
 
   if(CUDA_DYNAMIC_LOADING)

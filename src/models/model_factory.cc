@@ -6,6 +6,7 @@
 #include "ctranslate2/models/wav2vec2.h"
 #include "ctranslate2/models/wav2vec2bert.h"
 #include "ctranslate2/models/transformer.h"
+#include "ctranslate2/models/parakeet.h"
 
 namespace ctranslate2 {
   namespace models {
@@ -26,6 +27,8 @@ namespace ctranslate2 {
       register_model<Wav2Vec2Model>("Wav2Vec2Spec");
 
       register_model<Wav2Vec2BertModel>("Wav2Vec2BertSpec");
+
+      register_model<ParakeetModel>("ParakeetModel");
     }
 
     std::shared_ptr<Model> create_model(const std::string& name) {

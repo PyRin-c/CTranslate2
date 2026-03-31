@@ -19,6 +19,7 @@ namespace ctranslate2 {
     void register_whisper(py::module& m);
     void register_wav2vec2(py::module& m);
     void register_wav2vec2bert(py::module& m);
+    void register_parakeet(py::module& m);
     void register_mpi(py::module& m);
 
   }

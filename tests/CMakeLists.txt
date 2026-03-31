@@ -10,6 +10,7 @@ add_executable(ctranslate2_test
   decoding_test.cc
   layers_test.cc
   model_test.cc
+  parakeet_test.cc
   storage_view_test.cc
   ops_test.cc
   primitives_test.cc
@@ -23,6 +24,9 @@ target_link_libraries(ctranslate2_test PRIVATE
   ${PROJECT_NAME}
   gtest_main
   )
+if(MSVC)
+  target_compile_options(ctranslate2_test PRIVATE /utf-8)
+endif()
 
 add_executable(benchmark_ops
   benchmark_ops.cc

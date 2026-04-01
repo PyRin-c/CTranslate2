@@ -6,6 +6,8 @@ try:
     from ctranslate2._ext import (
         Parakeet,
         ParakeetResult,
+        VibeVoiceAsr,
+        VibeVoiceAsrResult,
         Wav2Vec2,
         Wav2Vec2Bert,
         Whisper,

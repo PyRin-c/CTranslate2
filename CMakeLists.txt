@@ -148,6 +148,7 @@ set(SOURCES
   src/models/sequence_to_sequence.cc
   src/models/transformer.cc
   src/models/parakeet.cc
+  src/models/vibevoice_asr.cc
   src/models/wav2vec2.cc
   src/models/wav2vec2bert.cc
   src/models/whisper.cc

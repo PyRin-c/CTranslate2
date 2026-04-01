@@ -838,5 +838,153 @@ namespace ctranslate2 {
       }
     }
 
+    // -----------------------------------------------------------------------
+    // decode_from_embeds: like decode() but accepts pre-computed embeddings.
+    // Skips embedding lookup, embeddings_scale, and project_in.
+    // Used by VibeVoice-ASR to prefill the KV-cache with audio+text embeddings.
+    // -----------------------------------------------------------------------
+    void TransformerDecoder::decode_from_embeds(const StorageView& inputs_embeds,
+                                                const StorageView* lengths,
+                                                dim_t step,
+                                                DecoderState& state,
+                                                StorageView* outputs,
+                                                StorageView* attention,
+                                                bool return_logits) {
+      PROFILE("TransformerDecoder::decode_from_embeds");
+      const DataType dtype = output_type();
+      const Device device = inputs_embeds.device();
+      constexpr bool is_sequence = true;  // inputs_embeds is always (batch, seq, hidden)
+
+      StorageView layer_in(dtype, device);
+      StorageView layer_out(dtype, device);
+
+      // Use pre-computed embeddings directly, cast to model compute dtype.
+      layer_in = inputs_embeds.to(dtype);
+
+      // Position encoding: for Qwen2 RoPE is inside attention layers, so typically nullptr.
+      // Apply if present (e.g. sinusoidal PE models).
+      if (_position_encoder)
+        (*_position_encoder)(layer_in, std::max(step, dim_t(0)));
+      if (_layernorm_embedding)
+        (*_layernorm_embedding)(layer_in, layer_in);
+
+      // inputs_embeds is already rank 3 — no need for expand_dims.
+
+      const dim_t batch_size = layer_in.dim(0);
+      const dim_t max_time = layer_in.dim(1);
+
+      const bool allow_padding_removal = Padder::allow_padding_removal(_device, _compute_type);
+
+      std::unique_ptr<const Padder> input_padder;
+      std::unique_ptr<const StorageView> input_lengths;
+      std::unique_ptr<const StorageView> input_lengths_mask;
+
+      if (!lengths) {
+        input_lengths = std::make_unique<StorageView>(
+          Shape{layer_in.dim(0)}, int32_t(max_time), device);
+        lengths = input_lengths.get();
+      }
+
+      bool multi_query = _layers.front()->get_self_attention().multi_query();
+
+      if (lengths) {
+        if (allow_padding_removal) {
+          input_padder = std::make_unique<Padder>(*lengths, max_time);
+          input_padder->remove_padding(layer_in);
+        }
+
+        dim_t num_heads = _num_heads;
+        if (_tensor_parallel)
+          num_heads = SAFE_DIVIDE(num_heads, ScopedMPISetter::getNRanks());
+
+        StorageView lengths_mask = layers::MultiHeadAttention::prepare_length_mask(
+          *lengths, num_heads, max_time, /*mask_future=*/true, multi_query);
+
+        if (step > 0)
+          ops::Add()(lengths_mask, StorageView(int32_t(step)), lengths_mask);
+
+        input_lengths_mask = std::make_unique<StorageView>(std::move(lengths_mask));
+      }
+
+      std::vector<StorageView> alignment_heads;
+      if (attention)
+        alignment_heads.reserve(_layers.size());
+
+      StorageView position_bias(dtype, device);
+      std::vector<StorageView> layer_ins;
+      layer_ins.push_back(std::move(layer_in));
+
+      for (size_t i = 0; i < layer_ins.size(); ++i) {
+        StorageView* layer_in_chunk = &layer_ins[i];
+        for (size_t l = 0; l < _layers.size(); ++l) {
+          StorageView* cached_self_attn_keys = nullptr;
+          StorageView* cached_self_attn_values = nullptr;
+
+          if (step >= 0) {
+            const std::string l_str = std::to_string(l);
+            cached_self_attn_keys   = &state.at("self_keys_"   + l_str);
+            cached_self_attn_values = &state.at("self_values_" + l_str);
+          }
+
+          std::unique_ptr<StorageView> heads_to_select = get_layer_alignment_heads(l, batch_size);
+          std::unique_ptr<StorageView> layer_attention;
+          if (attention && heads_to_select)
+            layer_attention = std::make_unique<StorageView>(dtype, device);
+
+          const dim_t offset = std::max(dim_t(0), dim_t(_sliding_window) * dim_t(i) + step);
+
+          (*_layers[l])(*layer_in_chunk,
+                        input_lengths_mask.get(),
+                        /*memory=*/nullptr,
+                        /*memory_lengths_mask=*/nullptr,
+                        cached_self_attn_keys,
+                        cached_self_attn_values,
+                        /*cached_attn_keys=*/nullptr,
+                        /*cached_attn_values=*/nullptr,
+                        layer_out,
+                        layer_attention.get(),
+                        input_padder.get(),
+                        /*memory_padder=*/nullptr,
+                        return_normalized_attention(),
+                        &position_bias,
+                        offset);
+          *layer_in_chunk = std::move(layer_out);
+
+          if (layer_attention) {
+            alignment_heads.emplace_back(dtype, device);
+            ops::Gather(1, 1)(*layer_attention, *heads_to_select, alignment_heads.back());
+          }
+        }
+        layer_in = std::move(*layer_in_chunk);
+      }
+
+      if (outputs) {
+        if (_output_norm)
+          (*_output_norm)(layer_in, layer_in);
+        if (_project_out) {
+          (*_project_out)(layer_in, layer_out);
+          layer_in = std::move(layer_out);
+        }
+        if (_outputs_scale)
+          ops::Mul()(layer_in, *_outputs_scale, layer_in);
+
+        if (return_logits)
+          _proj(layer_in, *outputs);
+        else
+          *outputs = std::move(layer_in);
+
+        // Always sequence — add padding back if needed.
+        if (input_padder)
+          input_padder->add_padding(*outputs);
+      }
+    }
+
+    void TransformerDecoder::forward_with_embeds(const StorageView& inputs_embeds,
+                                                 const StorageView& lengths,
+                                                 DecoderState& state,
+                                                 StorageView& logits) {
+      decode_from_embeds(inputs_embeds, &lengths, /*step=*/0, state, &logits);
+    }
+
   }
 }

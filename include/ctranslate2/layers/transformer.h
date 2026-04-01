@@ -184,6 +184,15 @@ namespace ctranslate2 {
                       StorageView& logits,
                       StorageView* attention = nullptr) override;
 
+      // Forward with pre-computed embeddings — skips embedding lookup.
+      // inputs_embeds: (batch, seq_len, hidden)
+      // lengths:       (batch,) int32 — valid length of each sequence
+      // logits:        (batch, seq_len, vocab) output
+      void forward_with_embeds(const StorageView& inputs_embeds,
+                               const StorageView& lengths,
+                               DecoderState& state,
+                               StorageView& logits);
+
       void set_alignment_heads(const dim_t layer, const dim_t num_heads_to_average);
       void set_alignment_heads(const std::vector<std::pair<dim_t, dim_t>>& alignment_heads);
 
@@ -206,6 +215,15 @@ namespace ctranslate2 {
                   StorageView* outputs = nullptr,
                   StorageView* attention = nullptr,
                   bool return_logits = true);
+
+      // Like decode() but uses pre-computed embeddings instead of token IDs.
+      void decode_from_embeds(const StorageView& inputs_embeds,
+                              const StorageView* lengths,
+                              dim_t step,
+                              DecoderState& state,
+                              StorageView* outputs = nullptr,
+                              StorageView* attention = nullptr,
+                              bool return_logits = true);
 
       const dim_t _num_heads;
       const ComputeType _compute_type;

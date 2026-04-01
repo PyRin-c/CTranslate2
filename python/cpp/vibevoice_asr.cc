@@ -16,12 +16,14 @@ namespace ctranslate2 {
 
       StorageView encode(const StorageView& waveform,
                          size_t chunk_size,
-                         size_t audio_token_id) {
+                         size_t audio_token_id,
+                         bool add_vae_noise) {
         std::shared_lock lock(_mutex);
         assert_model_is_ready();
         models::VibeVoiceAsrOptions opts;
         opts.chunk_size = chunk_size;
         opts.audio_token_id = audio_token_id;
+        opts.add_vae_noise = add_vae_noise;
         return _pool->encode(waveform, opts).get();
       }
 
@@ -129,6 +131,7 @@ namespace ctranslate2 {
              py::arg("waveform"),
              py::arg("chunk_size") = 1440000,
              py::arg("audio_token_id") = 151648,
+             py::arg("add_vae_noise") = false,
              R"pbdoc(
                Encodes a raw waveform into audio feature embeddings.
 
@@ -137,6 +140,10 @@ namespace ctranslate2 {
                            sampled at 24 kHz.
                  chunk_size: Samples per chunk for long-form audio (default 60s).
                  audio_token_id: Token ID used as the audio placeholder.
+                 add_vae_noise: Inject VAE reparameterisation noise into the acoustic
+                                latents (default ``False``). Leave ``False`` for
+                                deterministic inference; set ``True`` only to reproduce
+                                training-time stochastic sampling.
 
                Returns:
                  Float32 StorageView of shape ``(batch, audio_seq_len, lm_hidden_size)``.

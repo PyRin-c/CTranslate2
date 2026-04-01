@@ -46,6 +46,13 @@ namespace ctranslate2 {
 
       // Chunk size for encode_chunked() in samples (default: 60s @ 24kHz).
       size_t chunk_size = 1440000;
+
+      // Inject VAE reparameterisation noise during encode().
+      // Set to true only for training-style sampling; leave false (default) for inference.
+      // When false the mean of the acoustic latent distribution is used directly,
+      // avoiding random output and the precision-loss of a float32 round-trip on
+      // float16 models.
+      bool add_vae_noise = false;
     };
 
     struct VibeVoiceAsrResult {

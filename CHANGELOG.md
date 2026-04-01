@@ -2,6 +2,8 @@
 
 ### New features
 
+* Add VibeVoice-ASR model support: CausalConv1d / ConvNeXt acoustic encoder + Qwen2 28-layer decoder, with `ct2-vibevoice-asr-converter` CLI and `ctranslate2.models.VibeVoiceAsr` Python API
+
 ### Fixes and improvements
 
 ## [v4.7.1](https://github.com/OpenNMT/CTranslate2/releases/tag/v4.7.1) (2026-02-04)

@@ -456,13 +456,40 @@ namespace ctranslate2 {
     };
 
     // -----------------------------------------------------------------------
+    // VibeVoiceDecoder: private subclass of TransformerDecoder.
+    //
+    // TransformerDecoder::decode_from_embeds() is a protected method and
+    // calling it from outside the class hierarchy would require adding a
+    // public method to the library's ABI.  Instead we define a thin subclass
+    // here (in the .cc file) that wraps the protected helper as a public
+    // method.  The public header (transformer.h) is left unchanged.
+    // -----------------------------------------------------------------------
+    class VibeVoiceDecoder : public layers::TransformerDecoder {
+    public:
+      using layers::TransformerDecoder::TransformerDecoder;
+
+      // Prefill the KV-cache with pre-computed embeddings (skips embedding
+      // lookup).  Equivalent to step=0 autoregressive decode over the full
+      // prefix.
+      // inputs_embeds : (batch, seq_len, hidden)
+      // lengths       : (batch,) int32 — valid length of each sequence
+      // logits        : (batch, seq_len, vocab) output
+      void forward_with_embeds(const StorageView& inputs_embeds,
+                               const StorageView& lengths,
+                               layers::DecoderState& state,
+                               StorageView& logits) {
+        decode_from_embeds(inputs_embeds, &lengths, /*step=*/0, state, &logits);
+      }
+    };
+
+    // -----------------------------------------------------------------------
     // Pimpl struct
     // -----------------------------------------------------------------------
     struct VibeVoiceAsrReplica::Impl {
       std::unique_ptr<AcousticEncoder> acoustic_encoder;
       std::unique_ptr<AcousticEncoder> semantic_encoder;
       std::unique_ptr<MultiModalProjector> projector;
-      std::unique_ptr<layers::TransformerDecoder> decoder;
+      std::unique_ptr<VibeVoiceDecoder> decoder;
     };
 
     // -----------------------------------------------------------------------
@@ -551,7 +578,7 @@ namespace ctranslate2 {
       _impl->projector = std::make_unique<MultiModalProjector>(
         *model, "multi_modal_projector");
 
-      _impl->decoder = std::make_unique<layers::TransformerDecoder>(*model, "decoder");
+      _impl->decoder = std::make_unique<VibeVoiceDecoder>(*model, "decoder");
     }
 
     VibeVoiceAsrReplica::~VibeVoiceAsrReplica() = default;
@@ -610,8 +637,14 @@ namespace ctranslate2 {
       // Follows modeling_vibevoice_asr.py L347-350 (get_audio_features).
       // Only acoustic latents receive noise; semantic latents do not.
       // Falls back to config default (0.625) for models converted without this field.
+      //
+      // NOTE: This noise injection is disabled by default (options.add_vae_noise == false)
+      // because:
+      //   1. Inference should be deterministic by default.
+      //   2. The float32 round-trip introduces precision loss on float16 models.
+      // Enable only when reproducing training-time stochastic sampling.
       const float vae_std = _model->config.value("acoustic_vae_std", 0.625f);
-      if (vae_std > 0.0f) {
+      if (options.add_vae_noise && vae_std > 0.0f) {
         const DataType orig_dtype = acoustic_feat.dtype();
         StorageView af_f32 = acoustic_feat.to(DataType::FLOAT32).to(Device::CPU);
         const dim_t af_batch  = af_f32.dim(0);
@@ -673,12 +706,25 @@ namespace ctranslate2 {
       const float* aud_data = audio_f32_cpu.data<float>();
 
       for (dim_t b = 0; b < batch; ++b) {
+        // Count audio placeholder positions in input_ids for this batch item.
+        dim_t num_audio_slots = 0;
+        for (dim_t s = 0; s < seq_len; ++s) {
+          if (static_cast<size_t>(ids_data[b * seq_len + s]) == audio_token_id)
+            ++num_audio_slots;
+        }
+        const dim_t audio_len = audio_f32.dim(1);
+        if (num_audio_slots != audio_len)
+          throw std::runtime_error(
+            "VibeVoiceAsrReplica::_build_inputs_embeds: batch item " +
+            std::to_string(b) + " has " + std::to_string(num_audio_slots) +
+            " audio_token_id placeholder(s) but audio_features has " +
+            std::to_string(audio_len) + " frame(s). "
+            "Ensure input_ids contains exactly one audio_token_id per audio frame.");
+
         dim_t audio_pos = 0;
         for (dim_t s = 0; s < seq_len; ++s) {
           if (static_cast<size_t>(ids_data[b * seq_len + s]) == audio_token_id) {
-            if (audio_pos >= audio_f32.dim(1))
-              break;
-            const float* src = aud_data + (b * audio_f32.dim(1) + audio_pos) * hidden;
+            const float* src = aud_data + (b * audio_len + audio_pos) * hidden;
             float* dst = emb_data + (b * seq_len + s) * hidden;
             std::copy(src, src + hidden, dst);
             ++audio_pos;
@@ -692,6 +738,29 @@ namespace ctranslate2 {
 
     // -----------------------------------------------------------------------
     // generate: audio embeddings → KV-cache prefill → greedy/sampling/beam decode
+    //
+    // Design note — why a custom decode loop instead of src/decoding/beam_search.cc:
+    // -------------------------------------------------------------------------------
+    // The standard CTranslate2 decoding infrastructure (beam_search.cc / greedy_search.cc)
+    // drives the decoder via Decoder::operator()(token_ids, lengths, state, logits).
+    // That interface starts from token IDs and performs the embedding lookup internally.
+    //
+    // VibeVoice-ASR requires a two-phase approach:
+    //   Phase 1 (prefill) – The prefix sequence interleaves text token embeddings with
+    //     audio feature vectors at audio_token_id placeholder positions.  This CANNOT be
+    //     expressed as a plain token-ID sequence; it needs pre-computed inputs_embeds.
+    //     We therefore call VibeVoiceDecoder::forward_with_embeds() (which wraps the
+    //     protected decode_from_embeds()), bypassing the embedding table entirely.
+    //
+    //   Phase 2 (autoregressive) – After the KV-cache is filled, new tokens are pure
+    //     text tokens and could in principle use Decoder::operator()().  However, the
+    //     standard beam_search.cc does not support resuming from a pre-populated KV-cache
+    //     state produced by a different prefill path.
+    //
+    // TODO: Once CTranslate2 exposes a common API for embedding-prefilled generation
+    //   (e.g., a GenerationCallbacks hook or an explicit "prefill then decode" split),
+    //   this custom loop should be replaced to benefit from future infra improvements
+    //   (speculative decoding, async batching, etc.).
     //
     // Options honoured:
     //   max_new_tokens         – upper bound on generated tokens

@@ -594,6 +594,45 @@ namespace ctranslate2 {
       return decode(ids, &lengths, -1, state, &logits, attention);
     }
 
+    // -----------------------------------------------------------------------
+    // _apply_output_projection: shared output-projection block.
+    //
+    // Applies, in order: output_norm (if present), project_out (if present),
+    // outputs_scale (if present), and the final projection (or hidden-state
+    // passthrough when return_logits == false).
+    //
+    // Both decode() and decode_from_embeds() end with identical output logic,
+    // so they delegate here to avoid maintaining the same code twice.
+    // -----------------------------------------------------------------------
+    void TransformerDecoder::_apply_output_projection(StorageView& layer_in,
+                                                       StorageView& layer_out,
+                                                       StorageView* outputs,
+                                                       bool return_logits,
+                                                       bool is_sequence,
+                                                       const Padder* input_padder) {
+      if (!outputs)
+        return;
+
+      if (_output_norm)
+        (*_output_norm)(layer_in, layer_in);
+      if (_project_out) {
+        (*_project_out)(layer_in, layer_out);
+        layer_in = std::move(layer_out);
+      }
+      if (_outputs_scale)
+        ops::Mul()(layer_in, *_outputs_scale, layer_in);
+
+      if (return_logits)
+        _proj(layer_in, *outputs);
+      else
+        *outputs = std::move(layer_in);
+
+      if (!is_sequence)
+        outputs->squeeze(1);
+      else if (input_padder)
+        input_padder->add_padding(*outputs);
+    }
+
     void TransformerDecoder::decode(const StorageView& ids,
                                     const StorageView* lengths,
                                     dim_t step,
@@ -815,27 +854,8 @@ namespace ctranslate2 {
         }
       }
 
-      if (outputs) {
-        if (_output_norm)
-          (*_output_norm)(layer_in, layer_in);
-        if (_project_out) {
-          (*_project_out)(layer_in, layer_out);
-          layer_in = std::move(layer_out);
-        }
-
-        if (_outputs_scale)
-          ops::Mul()(layer_in, *_outputs_scale, layer_in);
-
-        if (return_logits)
-          _proj(layer_in, *outputs);
-        else
-          *outputs = std::move(layer_in);
-
-        if (!is_sequence)
-          outputs->squeeze(1);
-        else if (input_padder)
-          input_padder->add_padding(*outputs);
-      }
+      _apply_output_projection(layer_in, layer_out, outputs, return_logits,
+                               is_sequence, input_padder.get());
     }
 
     // -----------------------------------------------------------------------
@@ -958,32 +978,9 @@ namespace ctranslate2 {
         layer_in = std::move(*layer_in_chunk);
       }
 
-      if (outputs) {
-        if (_output_norm)
-          (*_output_norm)(layer_in, layer_in);
-        if (_project_out) {
-          (*_project_out)(layer_in, layer_out);
-          layer_in = std::move(layer_out);
-        }
-        if (_outputs_scale)
-          ops::Mul()(layer_in, *_outputs_scale, layer_in);
-
-        if (return_logits)
-          _proj(layer_in, *outputs);
-        else
-          *outputs = std::move(layer_in);
-
-        // Always sequence — add padding back if needed.
-        if (input_padder)
-          input_padder->add_padding(*outputs);
-      }
-    }
-
-    void TransformerDecoder::forward_with_embeds(const StorageView& inputs_embeds,
-                                                 const StorageView& lengths,
-                                                 DecoderState& state,
-                                                 StorageView& logits) {
-      decode_from_embeds(inputs_embeds, &lengths, /*step=*/0, state, &logits);
+      // Always a sequence — is_sequence=true, input_padder may or may not be set.
+      _apply_output_projection(layer_in, layer_out, outputs, return_logits,
+                               /*is_sequence=*/true, input_padder.get());
     }
 
   }

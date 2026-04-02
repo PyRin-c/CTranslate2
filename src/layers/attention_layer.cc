@@ -93,6 +93,11 @@ namespace ctranslate2 {
                                                                         "/rotary_high_freq_factor", 4.0);
       const auto rotary_low_freq_factor = model.get_attribute_with_default<float>(scope +
                                                                         "/rotary_low_freq_factor", 1.0);
+      // MRoPE: optional pre-computed inv_freq (shape [dim/2]) for Qwen3-ASR-style
+      // stride-3 interleaved multi-section RoPE.  When present it overrides the
+      // default base^(-2i/dim) computation inside RotaryEmbeddings::initialize().
+      const auto* mrope_inv_freq = model.get_variable_if_exists(scope + "/mrope_inv_freq");
+
       return std::make_unique<RotaryEmbeddings>(rotary_dim,
                                                 interleave,
                                                 scaling_type,
@@ -105,7 +110,8 @@ namespace ctranslate2 {
                                                 rotary_high_freq_factor,
                                                 original_max_position_embeddings,
                                                 max_position_embeddings,
-                                                transpose);
+                                                transpose,
+                                                mrope_inv_freq);
     }
 
 
@@ -186,7 +192,8 @@ namespace ctranslate2 {
                                        const float high_freq_factor,
                                        const dim_t original_max_position_embeddings,
                                        const dim_t max_position_embeddings,
-                                       const bool transpose)
+                                       const bool transpose,
+                                       const StorageView* custom_inv_freq)
       : _dim(dim)
       , _interleave(interleave)
       , _scaling_type(scaling_type)
@@ -201,6 +208,8 @@ namespace ctranslate2 {
       , _rotary_high_freq_factor(high_freq_factor)
       , _original_max_position_embeddings(original_max_position_embeddings)
       , _max_position_embeddings(max_position_embeddings)
+      , _custom_inv_freq(custom_inv_freq ?
+                         std::make_unique<StorageView>(custom_inv_freq->to(Device::CPU)) : nullptr)
       , _rotary_op(dim, interleave)
       , _transpose(transpose)
     {
@@ -254,7 +263,12 @@ namespace ctranslate2 {
                                       const Device device,
                                       const DataType dtype) {
       StorageView inv_freq({1, dim / 2});
-      if (_scaling_type == RotaryScalingType::Su) {
+      if (_custom_inv_freq) {
+        // MRoPE: use the caller-supplied inv_freq (shape [dim/2]) directly.
+        // Reshape to [1, dim/2] to match the standard layout.
+        inv_freq = _custom_inv_freq->sync_copy();
+        inv_freq.reshape({1, dim / 2});
+      } else if (_scaling_type == RotaryScalingType::Su) {
         StorageView* scaling_factor;
         for (dim_t i = 0; i < inv_freq.size(); ++i) {
           if (num_positions > _original_max_position_embeddings)

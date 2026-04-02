@@ -74,6 +74,9 @@ class MultiHeadAttentionSpec(model_spec.LayerSpec):
             self.rotary_dim = np.dtype("int32").type(rotary_dim)
             self.rotary_interleave = rotary_interleave
             self.rotary_base = np.dtype("float32").type(rotary_base)
+            # Optional MRoPE pre-computed inv_freq (shape [head_dim/2]).
+            # When set, overrides the standard base^(-2i/dim) computation.
+            self.mrope_inv_freq = model_spec.OPTIONAL
 
             if rotary_scaling_type is not None:
                 self.rotary_scaling_type = np.dtype("int8").type(rotary_scaling_type)

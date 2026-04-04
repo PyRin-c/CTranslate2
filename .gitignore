@@ -1,6 +1,8 @@
 *.pyc
+__pycache__/
 /.vs
 /build
+/install
 
 CMake*.json
 .idea

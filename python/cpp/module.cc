@@ -90,5 +90,6 @@ PYBIND11_MODULE(_ext, m)
   ctranslate2::python::register_wav2vec2bert(m);
   ctranslate2::python::register_parakeet(m);
   ctranslate2::python::register_vibevoice_asr(m);
+  ctranslate2::python::register_qwen3_asr(m);
   ctranslate2::python::register_mpi(m);
 }

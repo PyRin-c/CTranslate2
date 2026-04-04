@@ -90,7 +90,8 @@ namespace ctranslate2 {
                        const float high_freq_factor = 4.0,
                        const dim_t original_max_position_embeddings = 0,
                        const dim_t max_position_embeddings = 0,
-                       const bool transpose = true);
+                       const bool transpose = true,
+                       const StorageView* custom_inv_freq = nullptr);
 
       void apply(StorageView& x, const dim_t offset = 0, bool fa2 = false);
 
@@ -126,6 +127,10 @@ namespace ctranslate2 {
       const dim_t _max_position_embeddings;
       const ops::Rotary _rotary_op;
       const bool _transpose;
+
+      // Optional pre-computed inv_freq for MRoPE (stride-3 interleaved sections).
+      // When set, overrides the default base^(-2i/dim) computation in initialize().
+      std::unique_ptr<StorageView> _custom_inv_freq;
 
       StorageView _sin;
       StorageView _cos;

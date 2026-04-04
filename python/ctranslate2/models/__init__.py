@@ -8,6 +8,8 @@ try:
         ParakeetResult,
         VibeVoiceAsr,
         VibeVoiceAsrResult,
+        Qwen3ASR,
+        Qwen3ASRResult,
         Wav2Vec2,
         Wav2Vec2Bert,
         Whisper,

@@ -383,6 +383,15 @@ namespace ctranslate2 {
 
       // Block-diagonal attention mask: 0 within block, -1e9 across blocks.
       // Returns [1, 1, seq_len, seq_len] float32 on CPU.
+      //
+      // Complexity: O(seq_len²) time and memory.
+      // In practice this is bounded by the model's intended input length:
+      //   default n_window_infer=800 mel frames → eff_window=100 audio tokens
+      //   default n_window=50 → chunk_mel=100 frames → ~13 tokens/chunk
+      //   For 8 seconds of audio (T≈800): seq_len≈104 → mask ≈ 43 KB (negligible).
+      //   For very long audio (e.g. T=4000, 40s): seq_len≈520 → mask ≈ 1 MB.
+      // Inputs significantly longer than n_window_infer are outside the intended
+      // operating range and should be split into multiple API calls.
       static StorageView _make_windowed_mask(dim_t seq_len, dim_t window_tokens) {
         const float NEG_INF = -1e9f;
         StorageView mask({1, 1, seq_len, seq_len}, DataType::FLOAT32);
@@ -546,7 +555,13 @@ namespace ctranslate2 {
       embeddings(ids_dev, raw_embeds);
       inputs_embeds = raw_embeds.to(DataType::FLOAT32);
 
-      // Prepare audio on CPU float32 for the injection loop
+      // Audio-token injection is done on CPU because it requires a scatter-style
+      // write driven by a variable-length index list (audio_token_id positions),
+      // which has no direct CTranslate2 GPU op equivalent.  The round-trip
+      // (GPU → CPU for audio_features + embeddings, then CPU → GPU for the
+      // fused result) is acceptable here because it occurs once per generate()
+      // call before the decode loop, not inside the decode loop itself.
+      // Future improvement: implement a custom CUDA scatter kernel.
       StorageView audio_cpu = audio_features.to(DataType::FLOAT32).to(Device::CPU);
       StorageView ids_cpu   = input_ids.to(Device::CPU);
       StorageView emb_cpu   = inputs_embeds.to(Device::CPU);

@@ -266,6 +266,10 @@ namespace ctranslate2 {
       if (_custom_inv_freq) {
         // MRoPE: use the caller-supplied inv_freq (shape [dim/2]) directly.
         // Reshape to [1, dim/2] to match the standard layout.
+        if (_custom_inv_freq->size() != static_cast<size_t>(dim / 2))
+          throw std::runtime_error(
+            "mrope_inv_freq size mismatch: expected " + std::to_string(dim / 2)
+            + " but got " + std::to_string(_custom_inv_freq->size()));
         inv_freq = _custom_inv_freq->sync_copy();
         inv_freq.reshape({1, dim / 2});
       } else if (_scaling_type == RotaryScalingType::Su) {

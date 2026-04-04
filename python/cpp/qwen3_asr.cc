@@ -134,6 +134,8 @@ namespace ctranslate2 {
                Arguments:
                  features: Float32 StorageView of shape ``(batch, 128, T)``
                            containing mel spectrogram frames.
+                           All items in the batch must share the same ``T`` dimension
+                           (variable-length audio in a single batch is not supported).
                  encoder_window_tokens: Encoder attention window in audio tokens.
                    ``-1`` (default) uses offline full-attention (block-diagonal mask
                    covering the entire sequence). A positive value enables streaming
@@ -163,6 +165,8 @@ namespace ctranslate2 {
                Arguments:
                  features: Float32 StorageView of shape ``(batch, 128, T)``
                            containing mel spectrogram frames.
+                           All items in the batch must share the same ``T`` dimension
+                           (variable-length audio in a single batch is not supported).
                  prompts: List of token-ID sequences (list of list of int)
                           containing text tokens and ``audio_token_id`` placeholders.
                  max_new_tokens: Maximum number of tokens to generate.
@@ -172,7 +176,10 @@ namespace ctranslate2 {
                  repetition_penalty: Repetition penalty (> 1 penalizes repetition).
                  sampling_topk: Top-K sampling candidates (0 = full distribution).
                  sampling_temperature: Sampling temperature.
-                 num_hypotheses: Number of output hypotheses to return.
+                 num_hypotheses: Number of output hypotheses to return per batch element.
+                   When ``num_hypotheses > beam_size``, the actual number of returned
+                   hypotheses may be less than ``num_hypotheses`` (no error is raised);
+                   to guarantee N hypotheses, set ``beam_size >= num_hypotheses``.
                  return_scores: Include hypothesis log-probability scores.
                  audio_token_id: Token ID used as the audio placeholder (default 151676).
                  encoder_window_tokens: Encoder attention window in audio tokens.
@@ -180,6 +187,7 @@ namespace ctranslate2 {
 
                Returns:
                  List of :class:`Qwen3ASRResult`, one per batch element.
+                 Each result contains at most ``num_hypotheses`` sequences.
              )pbdoc")
         ;
     }

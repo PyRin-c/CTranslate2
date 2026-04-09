@@ -26,7 +26,8 @@ namespace ctranslate2 {
                                              const Padder*,
                                              bool return_normalized_attention,
                                              StorageView*,
-                                             dim_t offset) const {
+                                             dim_t offset,
+                                             bool kv_read_only) const {
       PROFILE("MultiHeadAttention");
       const Device device = queries.device();
       const DataType dtype = queries.dtype();
@@ -68,7 +69,7 @@ namespace ctranslate2 {
         _rotary_embeddings->apply(keys_proj, offset, true);
       }
 
-      if (cached_keys != nullptr) {
+      if (cached_keys != nullptr && !kv_read_only) {
         if (cached_keys->empty()) {
           *cached_keys = std::move(keys_proj);
           *cached_values = std::move(values_proj);

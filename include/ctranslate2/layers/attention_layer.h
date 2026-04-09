@@ -37,7 +37,8 @@ namespace ctranslate2 {
                       const Padder* values_padder = nullptr,
                       bool return_normalized_attention = true,
                       StorageView* position_bias = nullptr,
-                      dim_t offset = 0) const = 0;
+                      dim_t offset = 0,
+                      bool kv_read_only = false) const = 0;
 
       virtual bool has_positional_embeddings() const = 0;
 
@@ -74,6 +75,7 @@ namespace ctranslate2 {
       Linear,
       Su,
       Llama3,
+      Proportional,  // Gemma 4: apply RoPE to first partial_rotary_factor fraction of dims only
     };
 
     class RotaryEmbeddings {
@@ -91,7 +93,8 @@ namespace ctranslate2 {
                        const dim_t original_max_position_embeddings = 0,
                        const dim_t max_position_embeddings = 0,
                        const bool transpose = true,
-                       const StorageView* custom_inv_freq = nullptr);
+                       const StorageView* custom_inv_freq = nullptr,
+                       const float partial_rotary_factor = 1.0);
 
       void apply(StorageView& x, const dim_t offset = 0, bool fa2 = false);
 
@@ -118,6 +121,7 @@ namespace ctranslate2 {
       const RotaryScalingType _scaling_type;
       const float _scaling_factor;
       const float _base;
+      const float _partial_rotary_factor;
       const dim_t _num_initial_positions;
       std::unique_ptr<StorageView> _rotary_scaling_long_factor;
       std::unique_ptr<StorageView> _rotary_scaling_short_factor;

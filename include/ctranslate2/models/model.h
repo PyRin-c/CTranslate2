@@ -17,7 +17,7 @@ namespace ctranslate2 {
       AWQ_GEMV
     };
 
-    static const size_t current_binary_version = 6;
+    static const size_t current_binary_version = 7;  // v7: num_bytes is uint64
 
     // Checks whether the provided path could contain a CTranslate2 model.
     bool contains_model(const std::string& path);

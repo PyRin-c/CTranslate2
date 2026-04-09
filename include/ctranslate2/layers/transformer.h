@@ -100,7 +100,9 @@ namespace ctranslate2 {
                       const Padder* memory_padder = nullptr,
                       bool return_normalized_attention = true,
                       StorageView* position_bias = nullptr,
-                      dim_t offset = 0) const;
+                      dim_t offset = 0,
+                      const StorageView* per_layer_input = nullptr,
+                      bool kv_read_only = false) const;
 
       DataType output_type() const override {
         return _ff.output_type();
@@ -118,7 +120,15 @@ namespace ctranslate2 {
         return *_self_attention;
       }
 
+      // Returns the source layer index for KV cache sharing, or -1 if this layer
+      // has its own KV cache (the common case).
+      dim_t kv_shared_layer_index() const {
+        return _kv_shared_layer_index;
+      }
+
     private:
+      // Index of the source layer whose KV cache this layer borrows (-1 = own cache).
+      const dim_t _kv_shared_layer_index;
       const std::unique_ptr<AttentionLayer> _self_attention;
       const std::unique_ptr<const LayerNorm> _shared_layer_norm;
       const std::unique_ptr<const LayerNorm> _input_layer_norm;
@@ -129,6 +139,25 @@ namespace ctranslate2 {
       const FeedForwardNetwork _ff;
       const std::unique_ptr<const LayerNorm> _external_pre_encoder_attention_layer_norm;
       const std::unique_ptr<const LayerNorm> _external_post_encoder_attention_layer_norm;
+      // Gemma 4: per-layer scalar multiplied to the output after FFN residual
+      const float _layer_scalar;
+      // Gemma 4: per-layer embeddings (PLE)
+      const std::unique_ptr<const Dense> _per_layer_input_gate;
+      const std::unique_ptr<const Dense> _per_layer_projection;
+      const std::unique_ptr<const LayerNorm> _post_per_layer_input_norm;
+      // Gemma 4 MoE: router components
+      const std::unique_ptr<const LayerNorm> _router_norm;
+      const std::unique_ptr<const StorageView> _router_scale_prescaled;  // scale * (1/√H)
+      const std::unique_ptr<const Dense> _router_proj;                   // H → num_experts
+      const std::unique_ptr<const StorageView> _router_per_expert_scale; // [num_experts]
+      // Gemma 4 MoE: expert weights (3D tensors)
+      const std::unique_ptr<const StorageView> _experts_gate_up_proj;    // [E, 2*I, H]
+      const std::unique_ptr<const StorageView> _experts_down_proj;       // [E, H, I]
+      const dim_t _moe_top_k;
+      // Gemma 4 MoE: extra layer norms
+      const std::unique_ptr<const LayerNorm> _post_feedforward_layernorm_1;
+      const std::unique_ptr<const LayerNorm> _pre_feedforward_layernorm_2;
+      const std::unique_ptr<const LayerNorm> _post_feedforward_layernorm_2;
     };
 
     class TransformerEncoder : public Encoder
@@ -208,6 +237,18 @@ namespace ctranslate2 {
                   bool return_logits = true);
 
       // Like decode() but uses pre-computed embeddings instead of token IDs.
+      // input_ids (optional): [batch, seq_len] int32 token IDs, used to compute
+      // the token-side PLE contribution (Gemma 4 E-series only).
+      void decode_from_embeds(const StorageView& inputs_embeds,
+                              const StorageView* input_ids,
+                              const StorageView* lengths,
+                              dim_t step,
+                              DecoderState& state,
+                              StorageView* outputs = nullptr,
+                              StorageView* attention = nullptr,
+                              bool return_logits = true);
+
+      // Backward-compatible overload (no input_ids → token PLE skipped).
       void decode_from_embeds(const StorageView& inputs_embeds,
                               const StorageView* lengths,
                               dim_t step,
@@ -246,6 +287,25 @@ namespace ctranslate2 {
       Dense _proj;
       const dim_t _sliding_window;
       const bool _tensor_parallel;
+      // Gemma 4: final logit soft-capping: tanh(x/cap)*cap applied after lm_head
+      const float _final_logit_softcap;
+      // Gemma 4 E-series: per-layer embedding table [vocab_size, num_layers * per_layer_dim] int8.
+      // Looked up by token IDs to produce the token-side PLE contribution.
+      const std::unique_ptr<const StorageView> _per_layer_embeddings;
+      // Companion scale factors [vocab_size] float32 (one per vocabulary-token row).
+      const std::unique_ptr<const StorageView> _per_layer_embedding_scales;
+      // Gemma 4 E-series: model-projection for PLE [hidden_size → num_layers * per_layer_dim]
+      const std::unique_ptr<const Dense> _per_layer_model_proj;
+      // Gemma 4 E-series: per-layer projection norm [per_layer_dim]
+      const std::unique_ptr<const LayerNorm> _per_layer_proj_norm;
+
+      // Compute combined per-layer input tensors for all layers.
+      // Returns a vector of length num_layers; each element is [batch, seq, per_layer_dim].
+      // If PLE weights are not present, returns an empty vector.
+      std::vector<StorageView> _compute_per_layer_inputs(
+          const StorageView* ids,              // [batch, seq] int32, optional
+          const StorageView& inputs_embeds     // [batch, seq, hidden]
+      ) const;
     };
 
   }

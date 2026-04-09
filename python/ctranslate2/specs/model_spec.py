@@ -22,7 +22,7 @@ except ImportError:
     torch_is_available = False
 
 OPTIONAL = "__optional"
-CURRENT_BINARY_VERSION = 6
+CURRENT_BINARY_VERSION = 7  # v7: num_bytes field widened to uint64 (was uint32)
 
 ACCEPTED_MODEL_TYPES = (
     "int8",
@@ -406,7 +406,7 @@ class ModelSpec(LayerSpec):
                 for dim in value.shape:
                     model.write(struct.pack("I", dim))
                 model.write(struct.pack("B", _dtype_to_type_id(value.dtype)))
-                model.write(struct.pack("I", value.num_bytes()))
+                model.write(struct.pack("Q", value.num_bytes()))  # uint64 since v7
                 model.write(value.to_bytes())
             model.write(struct.pack("I", len(aliases)))
             for alias, variable_name in aliases:

@@ -418,6 +418,12 @@ namespace ctranslate2 {
           if (lengths) {
             size = lengths[i];
 
+            // Clamp to depth: can't attend to more keys than exist.
+            // This handles kv_shared prefill where the causal mask value
+            // can exceed the actual cached key count.
+            if (size > depth)
+              size = depth;
+
             // Directly set 0 in output for out of range positions.
             for (dim_t j = size; j < depth; ++j) {
               y[j] = 0;

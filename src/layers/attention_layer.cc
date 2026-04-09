@@ -98,6 +98,10 @@ namespace ctranslate2 {
       // default base^(-2i/dim) computation inside RotaryEmbeddings::initialize().
       const auto* mrope_inv_freq = model.get_variable_if_exists(scope + "/mrope_inv_freq");
 
+      // Proportional RoPE (Gemma 4): fraction of head_dim dimensions that get RoPE applied.
+      const auto partial_rotary_factor = model.get_attribute_with_default<float>(
+        scope + "/rotary_partial_rotary_factor", 1.0f);
+
       return std::make_unique<RotaryEmbeddings>(rotary_dim,
                                                 interleave,
                                                 scaling_type,
@@ -111,7 +115,8 @@ namespace ctranslate2 {
                                                 original_max_position_embeddings,
                                                 max_position_embeddings,
                                                 transpose,
-                                                mrope_inv_freq);
+                                                mrope_inv_freq,
+                                                partial_rotary_factor);
     }
 
 
@@ -193,12 +198,14 @@ namespace ctranslate2 {
                                        const dim_t original_max_position_embeddings,
                                        const dim_t max_position_embeddings,
                                        const bool transpose,
-                                       const StorageView* custom_inv_freq)
+                                       const StorageView* custom_inv_freq,
+                                       const float partial_rotary_factor)
       : _dim(dim)
       , _interleave(interleave)
       , _scaling_type(scaling_type)
       , _scaling_factor(scaling_factor)
       , _base(base)
+      , _partial_rotary_factor(partial_rotary_factor)
       , _num_initial_positions(num_initial_positions)
       , _rotary_scaling_long_factor(long_scaling_factor ?
                                     std::make_unique<StorageView>(*long_scaling_factor) : nullptr)
@@ -281,6 +288,18 @@ namespace ctranslate2 {
             scaling_factor = _rotary_scaling_short_factor.get();
           inv_freq.at<float>(i) = 1.f / (scaling_factor->at<float>(i) *
                                          (std::pow(_base, float(i * 2) / float(dim))));
+        }
+      }
+      else if (_scaling_type == RotaryScalingType::Proportional) {
+        // Proportional RoPE (Gemma 4 full-attention layers):
+        // Apply standard RoPE to the first partial_rotary_factor fraction of dimensions,
+        // set the remaining inv_freq to 0 so those dims become identity (cos=1, sin=0).
+        const dim_t rope_angles = static_cast<dim_t>(_partial_rotary_factor * dim) / 2;
+        for (dim_t i = 0; i < inv_freq.size(); ++i) {
+          if (i < rope_angles)
+            inv_freq.at<float>(i) = 1.f / std::pow(_base, float(i * 2) / float(dim));
+          else
+            inv_freq.at<float>(i) = 0.f;
         }
       }
       else {

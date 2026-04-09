@@ -2,6 +2,7 @@
 
 ### New features
 
+* Add Gemma 4 multimodal model support (`Gemma4ForConditionalGeneration`): SigLIP-based vision encoder (2-D RoPE, GeGLU, per-head qk/v_norm) + Gemma 4 text decoder, with `ct2-transformers-converter` conversion and `ctranslate2.models.Gemma4` Python API supporting greedy, sampling, and beam-search generation
 * Add VibeVoice-ASR model support: CausalConv1d / ConvNeXt acoustic encoder + Qwen2 28-layer decoder, with `ct2-vibevoice-asr-converter` CLI and `ctranslate2.models.VibeVoiceAsr` Python API
 
 ### Fixes and improvements

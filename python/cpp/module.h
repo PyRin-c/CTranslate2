@@ -22,6 +22,7 @@ namespace ctranslate2 {
     void register_parakeet(py::module& m);
     void register_vibevoice_asr(py::module& m);
     void register_qwen3_asr(py::module& m);
+    void register_gemma4(py::module& m);
     void register_mpi(py::module& m);
 
   }

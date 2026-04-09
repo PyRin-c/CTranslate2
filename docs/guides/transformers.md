@@ -10,6 +10,7 @@ CTranslate2 supports selected models from Hugging Face's [Transformers](https://
 * Falcon
 * Gemma 2
 * Gemma 3 (text only)
+* Gemma 4 (multimodal, see [Gemma 4 guide](gemma4.md))
 * Llama
 * M2M100
 * MarianMT

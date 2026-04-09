@@ -402,6 +402,8 @@ namespace ctranslate2 {
 
         const StorageView& weight = *pair.second;
         const DataType dtype = weight.dtype();
+        if (weight.rank() < 2)
+          continue;
         const dim_t k = weight.dim(1);
         const dim_t n = weight.dim(0);
 
@@ -644,7 +646,12 @@ namespace ctranslate2 {
 
         DataType dtype;
         dim_t num_bytes = 0;
-        if (binary_version >= 4) {
+        if (binary_version >= 7) {
+          // v7+: type_id (uint8) + num_bytes (uint64) to support tensors > 4 GB.
+          const auto type_id = consume<uint8_t>(model_file);
+          dtype = static_cast<DataType>(type_id);
+          num_bytes = static_cast<dim_t>(consume<uint64_t>(model_file));
+        } else if (binary_version >= 4) {
           const auto type_id = consume<uint8_t>(model_file);
           dtype = static_cast<DataType>(type_id);
           num_bytes = consume<uint32_t>(model_file);

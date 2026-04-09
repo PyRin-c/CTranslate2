@@ -12,6 +12,7 @@ class RotaryScalingType(enum.IntEnum):
     Linear = 0
     Su = 1
     Llama3 = 2
+    Proportional = 3  # Gemma 4: RoPE applied to first partial_rotary_factor fraction of dims
 
 
 class MultiHeadAttentionSpec(model_spec.LayerSpec):
@@ -35,6 +36,8 @@ class MultiHeadAttentionSpec(model_spec.LayerSpec):
         qk_norm=False,
         qk_norm_rms=True,
         has_norm=True,
+        k_eq_v=False,
+        v_norm=False,
     ):
         self.queries_scale = model_spec.OPTIONAL
 
@@ -47,6 +50,15 @@ class MultiHeadAttentionSpec(model_spec.LayerSpec):
         if qk_norm:
             self.q_norm = common_spec.LayerNormSpec(rms_norm=qk_norm_rms)
             self.k_norm = common_spec.LayerNormSpec(rms_norm=qk_norm_rms)
+
+        if k_eq_v:
+            # K and V share the same projection weight (no v_proj).
+            # The flag tells C++ to split fused_proj into [Q; K] only.
+            self.k_eq_v = True
+
+        if k_eq_v or v_norm:
+            # Scaleless RMSNorm applied to V (Gemma 4 v_norm, with_scale=False).
+            self.v_norm = common_spec.LayerNormSpec(rms_norm=True)
 
         if relative_position:
             self.relative_position_keys = None
@@ -90,6 +102,9 @@ class MultiHeadAttentionSpec(model_spec.LayerSpec):
             elif rotary_scaling_type is RotaryScalingType.Llama3:
                 self.rotary_low_freq_factor = None
                 self.rotary_high_freq_factor = None
+            elif rotary_scaling_type is RotaryScalingType.Proportional:
+                # partial_rotary_factor is set per-layer by the converter
+                self.rotary_partial_rotary_factor = model_spec.OPTIONAL
 
         if num_heads_kv is not None:
             self.num_heads_kv = np.dtype("int32").type(num_heads_kv)

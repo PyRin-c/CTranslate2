@@ -45,7 +45,8 @@ namespace ctranslate2 {
                       const Padder* values_padder = nullptr,
                       bool return_normalized_attention = true,
                       StorageView* position_bias = nullptr,
-                      dim_t offset = 0) const override;
+                      dim_t offset = 0,
+                      bool kv_read_only = false) const override;
 
       virtual bool has_positional_embeddings() const override {
             return _relative_position_keys || _relative_attention_bias || _rotary_embeddings || _alibi;
@@ -89,8 +90,10 @@ namespace ctranslate2 {
       dim_t _relative_right_max_position;
       const bool _merge_time_and_head_dims;
       const dim_t _cache_time_dim;
+      const bool _k_eq_v;  // Gemma 4: keys and values share the same projection (no v_proj)
       std::unique_ptr<const LayerNorm> _q_norm;  // Query normalization
       std::unique_ptr<const LayerNorm> _k_norm;  // Key normalization
+      std::unique_ptr<const LayerNorm> _v_norm;  // Value normalization (scaleless, Gemma 4)
 
       // RotorQuant KV-cache compression (nullptr when disabled).
       // Enabled by setting the environment variable CT2_ROTOR_QUANT_BITS=3 or =4.

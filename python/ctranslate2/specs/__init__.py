@@ -17,3 +17,4 @@ from ctranslate2.specs.wav2vec2_spec import Wav2Vec2Spec
 from ctranslate2.specs.conformer_spec import ParakeetModelSpec
 from ctranslate2.specs.wav2vec2bert_spec import Wav2Vec2BertSpec
 from ctranslate2.specs.whisper_spec import WhisperSpec
+from ctranslate2.specs.gemma4_spec import Gemma4Spec

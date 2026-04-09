@@ -151,7 +151,10 @@ class TransformerDecoderSpec(model_spec.LayerSpec):
         quant_group_size: Optional[int] = None,
         quant_bits: Optional[int] = None,
         qk_norm: bool = False,
+        v_norm: bool = False,
         external_pre_post_encoder_layers: Optional[bool] = False,
+        per_layer_input: bool = False,
+        has_moe: bool = False,
     ):
         """Initializes a Transformer decoder specification.
 
@@ -262,11 +265,28 @@ class TransformerDecoderSpec(model_spec.LayerSpec):
                 head_dim=head_dim,
                 sliding_window=sliding_window,
                 qk_norm=qk_norm,
+                v_norm=v_norm,
                 external_pre_post_encoder_layers=external_pre_post_encoder_layers,
+                per_layer_input=per_layer_input,
+                has_moe=has_moe,
             )
             for _ in range(num_layers)
         ]
         self.start_from_zero_embedding = False
+        # Gemma 4: logit soft-capping and per-layer embedding table (set by converter when used)
+        self.final_logit_softcap = model_spec.OPTIONAL
+        # Per-layer token embedding table [vocab_size, num_layers*per_layer_dim].
+        # Stored as float16 (current) or int8 (legacy). Use "per_layer_token_embedding"
+        # + "per_layer_token_scale" to avoid triggering the CT2 auto-quantize pipeline
+        # (which looks for the "{name}_scale" pattern).
+        self.per_layer_token_embedding = model_spec.OPTIONAL
+        self.per_layer_token_scale = model_spec.OPTIONAL  # int8 legacy only
+        # Backward-compat alias kept so old converted models still work (OPTIONAL).
+        self.per_layer_model_embedding = model_spec.OPTIONAL
+        # Gemma 4 E-series: decoder-level PLE projection weights (set when per_layer_input is True)
+        if per_layer_input:
+            self.per_layer_model_projection = common_spec.LinearSpec()
+            self.per_layer_projection_norm = common_spec.LayerNormSpec(rms_norm=True)
         self._config["multi_query_attention"] = multi_query_attention or (
             num_heads_kv != num_heads
         )
@@ -359,6 +379,10 @@ class TransformerDecoderLayerSpec(model_spec.LayerSpec):
         sliding_window=None,
         qk_norm=False,
         external_pre_post_encoder_layers=False,
+        k_eq_v=False,
+        v_norm=False,
+        per_layer_input=False,
+        has_moe=False,
     ):
         self.self_attention = attention_spec.MultiHeadAttentionSpec(
             self_attention=True,
@@ -376,6 +400,8 @@ class TransformerDecoderLayerSpec(model_spec.LayerSpec):
             head_dim=head_dim,
             sliding_window=sliding_window,
             qk_norm=qk_norm,
+            k_eq_v=k_eq_v,
+            v_norm=v_norm,
         )
 
         if with_encoder_attention:
@@ -425,6 +451,35 @@ class TransformerDecoderLayerSpec(model_spec.LayerSpec):
 
             delattr(self.self_attention, "layer_norm")
             delattr(self.ffn, "layer_norm")
+
+        # Gemma 4: per-layer scalar and Per-Layer Embeddings (PLE)
+        self.layer_scalar = model_spec.OPTIONAL
+        if per_layer_input:
+            self.per_layer_input_gate = common_spec.LinearSpec()
+            self.per_layer_projection = common_spec.LinearSpec()
+            self.post_per_layer_input_norm = common_spec.LayerNormSpec(rms_norm=True)
+
+        # Gemma 4 MoE (26B-A4B): parallel dense + sparse MoE FFN
+        if has_moe:
+            # Router: scaleless RMSNorm → scale → Linear → Softmax → TopK → normalize → per_expert_scale
+            self.router_norm = common_spec.LayerNormSpec(rms_norm=True)
+            # gamma set to ones(H) by converter (scaleless norm, no learnable weight)
+            self.router_scale = None             # (hidden_size,) learnable scale
+            self.router_proj = common_spec.LinearSpec()  # H → num_experts
+            self.router_per_expert_scale = None  # (num_experts,) per-expert scale
+            # Expert weights stored as 3D tensors: [num_experts, out, in]
+            self.experts_gate_up_proj = None  # [E, 2*I, H]
+            self.experts_down_proj = None     # [E, H, I]
+            # MoE top-k attribute (int32 scalar, set by converter)
+            self.moe_top_k = None
+            # Extra layer norms for MoE path
+            self.post_feedforward_layernorm_1 = common_spec.LayerNormSpec(rms_norm=True)
+            self.pre_feedforward_layernorm_2 = common_spec.LayerNormSpec(rms_norm=True)
+            self.post_feedforward_layernorm_2 = common_spec.LayerNormSpec(rms_norm=True)
+
+        # Gemma 4 KV Cache Sharing (E2B / E4B): index of the source layer whose
+        # cached K/V this layer borrows. -1 (or absent) means no sharing.
+        self.kv_shared_layer_index = model_spec.OPTIONAL
 
 
 class FeedForwardSpec(model_spec.LayerSpec):
@@ -646,6 +701,8 @@ class TransformerDecoderModelSpec(model_spec.LanguageModelSpec):
         quant_group_size: Optional[int] = None,
         quant_bits: Optional[int] = None,
         qk_norm: bool = False,
+        per_layer_input: bool = False,
+        has_moe: bool = False,
     ):
         """Creates a Transformer decoder model specification.
 
@@ -721,6 +778,8 @@ class TransformerDecoderModelSpec(model_spec.LanguageModelSpec):
             quant_group_size=quant_group_size,
             quant_bits=quant_bits,
             qk_norm=qk_norm,
+            per_layer_input=per_layer_input,
+            has_moe=has_moe,
         )
 
         return cls(decoder)

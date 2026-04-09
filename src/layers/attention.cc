@@ -309,8 +309,10 @@ namespace ctranslate2 {
                                   && !_relative_position_keys
                                   && !_relative_position_values)
       ,_cache_time_dim(_merge_time_and_head_dims ? 1 : 2)
+      , _k_eq_v(model.get_flag_with_default(scope + "/k_eq_v", false))
       , _q_norm(build_optional_layer<LayerNorm>(model, scope + "/q_norm"))
       , _k_norm(build_optional_layer<LayerNorm>(model, scope + "/k_norm"))
+      , _v_norm(build_optional_layer<LayerNorm>(model, scope + "/v_norm"))
     {
       if (_relative_position_keys)
         _maximum_relative_position = (_relative_position_keys->dim(0) - 1) / 2;
@@ -440,7 +442,8 @@ namespace ctranslate2 {
                                         const Padder* values_padder,
                                         bool return_normalized_attention,
                                         StorageView* position_bias,
-                                        dim_t offset) const {
+                                        dim_t offset,
+                                        bool kv_read_only) const {
       PROFILE("MultiHeadAttention");
       const Device device = queries.device();
       const DataType dtype = queries.dtype();
@@ -472,21 +475,53 @@ namespace ctranslate2 {
           if (queries_padder)
             queries_padder->add_padding(fused_proj);
 
-          const ops::Split split_op(2, {_num_heads * _d_head, _num_heads_kv * _d_head, _num_heads_kv * _d_head});
-          split_op(fused_proj, queries_proj, keys_proj, values_proj);
+          if (_k_eq_v) {
+            // K=V weight sharing (Gemma 4 full-attention layers):
+            // fused_proj contains [Q; K] only (no V projection).
+            // Clone K as the raw V source, then apply separate norms.
+            const ops::Split split_op(2, {_num_heads * _d_head, _num_heads_kv * _d_head});
+            split_op(fused_proj, queries_proj, keys_proj);
+            values_proj = keys_proj;  // V = raw K before k_norm/RoPE
 
-          if (_merge_time_and_head_dims) {
-            queries_proj.reshape({queries_proj.dim(0), -1, _d_head});
-            apply_qk_norm(queries_proj, keys_proj);
-          } else {
             split_heads(queries_proj, _num_heads);
             split_heads(keys_proj, _num_heads_kv);
             split_heads(values_proj, _num_heads_kv);
 
-            apply_qk_norm(queries_proj, keys_proj);
+            apply_qk_norm(queries_proj, keys_proj);  // k_norm has learnable scale
+
+            // V-norm (scaleless RMSNorm): applied to V before attention, no RoPE
+            if (_v_norm) {
+              StorageView values_normed(values_proj.dtype(), values_proj.device());
+              (*_v_norm)(values_proj, values_normed);
+              values_proj = std::move(values_normed);
+            }
 
             replicate_heads(keys_proj, _num_heads / _num_heads_kv);
             replicate_heads(values_proj, _num_heads / _num_heads_kv);
+          } else {
+            const ops::Split split_op(2, {_num_heads * _d_head, _num_heads_kv * _d_head, _num_heads_kv * _d_head});
+            split_op(fused_proj, queries_proj, keys_proj, values_proj);
+
+            if (_merge_time_and_head_dims) {
+              queries_proj.reshape({queries_proj.dim(0), -1, _d_head});
+              apply_qk_norm(queries_proj, keys_proj);
+            } else {
+              split_heads(queries_proj, _num_heads);
+              split_heads(keys_proj, _num_heads_kv);
+              split_heads(values_proj, _num_heads_kv);
+
+              apply_qk_norm(queries_proj, keys_proj);
+
+              // Apply V-norm (scaleless RMSNorm) to values if present (Gemma 4)
+              if (_v_norm) {
+                StorageView values_normed(values_proj.dtype(), values_proj.device());
+                (*_v_norm)(values_proj, values_normed);
+                values_proj = std::move(values_normed);
+              }
+
+              replicate_heads(keys_proj, _num_heads / _num_heads_kv);
+              replicate_heads(values_proj, _num_heads / _num_heads_kv);
+            }
           }
 
         } else {
@@ -511,7 +546,7 @@ namespace ctranslate2 {
           }
         }
 
-        if (cached_keys != nullptr) {
+        if (cached_keys != nullptr && !kv_read_only) {
           if (_rotor_quant && keys_proj.rank() == 4) {
             // --- RotorQuant compressed path ---
             // Only active for standard 4-D KV tensors [batch, heads, time, d_head].

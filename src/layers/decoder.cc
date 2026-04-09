@@ -47,6 +47,8 @@ namespace ctranslate2 {
       }
 
       for (auto& [name, value] : state) {
+        if (!value)  // Skip empty state (e.g., KV-shared layers leave their own cache empty).
+          continue;
         if (replicate_state(name))
           ops::Gather()(value, beam_indices);
         else if (alive_batches)

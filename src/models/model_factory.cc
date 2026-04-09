@@ -9,6 +9,7 @@
 #include "ctranslate2/models/parakeet.h"
 #include "ctranslate2/models/vibevoice_asr.h"
 #include "ctranslate2/models/qwen3_asr.h"
+#include "ctranslate2/models/gemma4.h"
 
 namespace ctranslate2 {
   namespace models {
@@ -33,6 +34,7 @@ namespace ctranslate2 {
       register_model<ParakeetModel>("ParakeetModel");
       register_model<VibeVoiceAsrModel>("VibeVoiceAsrSpec");
       register_model<Qwen3ASRModel>("Qwen3ASRSpec");
+      register_model<Gemma4Model>("Gemma4Spec");
     }
 
     std::shared_ptr<Model> create_model(const std::string& name) {

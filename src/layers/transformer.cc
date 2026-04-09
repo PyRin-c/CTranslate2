@@ -1,6 +1,15 @@
 #include "ctranslate2/layers/transformer.h"
 
 #include <cmath>
+#include <cstring>
+
+#include "ctranslate2/ops/dequantize.h"
+#include "ctranslate2/ops/gather.h"
+#include "ctranslate2/ops/matmul.h"
+#include "ctranslate2/ops/slide.h"
+#include "ctranslate2/ops/softmax.h"
+#include "ctranslate2/ops/tanh.h"
+#include "ctranslate2/ops/topk.h"
 
 namespace ctranslate2 {
   namespace layers {
@@ -186,6 +195,49 @@ namespace ctranslate2 {
                                      model, scope + "/external_pre_encoder_attention_layer_norm"))
       , _external_post_encoder_attention_layer_norm(build_optional_layer<LayerNorm>(
                                      model, scope + "/external_post_encoder_attention_layer_norm"))
+      , _kv_shared_layer_index(model.get_attribute_with_default<int32_t>(
+                                     scope + "/kv_shared_layer_index", -1))
+      , _layer_scalar(model.get_attribute_with_default<float>(scope + "/layer_scalar", 1.0f))
+      , _per_layer_input_gate(build_optional_layer<Dense>(model, scope + "/per_layer_input_gate"))
+      , _per_layer_projection(build_optional_layer<Dense>(model, scope + "/per_layer_projection"))
+      , _post_per_layer_input_norm(build_optional_layer<LayerNorm>(
+                                     model, scope + "/post_per_layer_input_norm"))
+      , _router_norm(build_optional_layer<LayerNorm>(model, scope + "/router_norm"))
+      , _router_scale_prescaled([&]() -> std::unique_ptr<const StorageView> {
+          const auto* v = model.get_variable_if_exists(scope + "/router_scale");
+          if (!v) return nullptr;
+          const DataType dtype = get_default_float_type(model.effective_compute_type());
+          return std::make_unique<StorageView>(v->to(dtype));
+        }())
+      , _router_proj([&]() -> std::unique_ptr<const Dense> {
+          if (!model.get_variable_if_exists(scope + "/router_proj/weight")) return nullptr;
+          return std::make_unique<Dense>(model, scope + "/router_proj");
+        }())
+      , _router_per_expert_scale([&]() -> std::unique_ptr<const StorageView> {
+          const auto* v = model.get_variable_if_exists(scope + "/router_per_expert_scale");
+          if (!v) return nullptr;
+          const DataType dtype = get_default_float_type(model.effective_compute_type());
+          return std::make_unique<StorageView>(v->to(dtype));
+        }())
+      , _experts_gate_up_proj([&]() -> std::unique_ptr<const StorageView> {
+          const auto* v = model.get_variable_if_exists(scope + "/experts_gate_up_proj");
+          if (!v) return nullptr;
+          const DataType dtype = get_default_float_type(model.effective_compute_type());
+          return std::make_unique<StorageView>(v->to(dtype));
+        }())
+      , _experts_down_proj([&]() -> std::unique_ptr<const StorageView> {
+          const auto* v = model.get_variable_if_exists(scope + "/experts_down_proj");
+          if (!v) return nullptr;
+          const DataType dtype = get_default_float_type(model.effective_compute_type());
+          return std::make_unique<StorageView>(v->to(dtype));
+        }())
+      , _moe_top_k(model.get_attribute_with_default<int32_t>(scope + "/moe_top_k", 0))
+      , _post_feedforward_layernorm_1(build_optional_layer<LayerNorm>(
+                                     model, scope + "/post_feedforward_layernorm_1"))
+      , _pre_feedforward_layernorm_2(build_optional_layer<LayerNorm>(
+                                     model, scope + "/pre_feedforward_layernorm_2"))
+      , _post_feedforward_layernorm_2(build_optional_layer<LayerNorm>(
+                                     model, scope + "/post_feedforward_layernorm_2"))
       {
     }
 
@@ -203,7 +255,9 @@ namespace ctranslate2 {
                                              const Padder* memory_padder,
                                              bool return_normalized_attention,
                                              StorageView* position_bias,
-                                             dim_t offset) const {
+                                             dim_t offset,
+                                             const StorageView* per_layer_input,
+                                             bool kv_read_only) const {
       PROFILE("TransformerDecoderLayer");
 
       const DataType dtype = input.dtype();
@@ -227,7 +281,8 @@ namespace ctranslate2 {
                              input_padder,
                              true,
                              position_bias,
-                             offset);
+                             offset,
+                             kv_read_only);
 
         (*_post_attention_layer_norm)(context, output);
         ops::Add()(output, input, output);
@@ -269,6 +324,36 @@ namespace ctranslate2 {
         hidden = std::move(output);
         (*_post_feedforward_layer_norm)(hidden, output);
         ops::Add()(output, context, output);
+
+        // Gemma 4: Dense FFN path done. Apply PLE block if present.
+        if (per_layer_input && _per_layer_input_gate && _per_layer_projection
+            && _post_per_layer_input_norm) {
+          // gate(output) → GELUTanh → * per_layer_input → projection → post_norm → + output
+          StorageView gate_out(dtype, device);
+          (*_per_layer_input_gate)(output, gate_out);
+          { const ops::GELU gelu_tanh(ops::GELU::Approximation::Tanh); gelu_tanh(gate_out, gate_out); }
+          // Broadcast per_layer_input [B, T, D] to match gate_out [B, T, D]
+          ops::Mul()(gate_out, *per_layer_input, gate_out);
+          StorageView proj_out(dtype, device);
+          (*_per_layer_projection)(gate_out, proj_out);
+          StorageView normed(dtype, device);
+          (*_post_per_layer_input_norm)(proj_out, normed);
+          ops::Add()(output, normed, output);
+        }
+
+        // Gemma 4 MoE: parallel sparse expert path (placeholder — full impl in gemma4.cc)
+        // This path is not reached for E2B (dense-only); 26B-A4B MoE support is deferred.
+        (void)_router_norm; (void)_router_proj; (void)_experts_gate_up_proj;
+        (void)_experts_down_proj; (void)_router_scale_prescaled;
+        (void)_router_per_expert_scale; (void)_pre_feedforward_layernorm_2;
+        (void)_post_feedforward_layernorm_2;
+
+        // Gemma 4: multiply full hidden state by layer_scalar
+        // Note: scalar StorageView must be on CPU; primitives<CUDA>::mul(scalar, ...) reads the
+        // value on the host via b.data<T>()[0], so a CUDA scalar would segfault.
+        if (_layer_scalar != 1.0f)
+          ops::Mul()(output, StorageView(_layer_scalar), output);
+
         return;
       }
 
@@ -489,7 +574,21 @@ namespace ctranslate2 {
       , _with_encoder_attention(_layers.front()->has_cross_attention())
       , _proj(model, scope + "/projection")
       , _sliding_window(model.get_attribute_with_default<int32_t>(scope + "/sliding_window", 0))
-      , _tensor_parallel(model.tensor_parallel()) {
+      , _tensor_parallel(model.tensor_parallel())
+      , _final_logit_softcap(model.get_attribute_with_default<float>(scope + "/final_logit_softcap", 0.0f))
+      , _per_layer_embeddings([&]() -> std::unique_ptr<const StorageView> {
+          const auto* v = model.get_variable_if_exists(scope + "/per_layer_token_embedding");
+          if (!v) return nullptr;
+          // Keep as int8 on CPU for efficient lookup
+          return std::make_unique<StorageView>(v->to(Device::CPU));
+        }())
+      , _per_layer_embedding_scales([&]() -> std::unique_ptr<const StorageView> {
+          const auto* v = model.get_variable_if_exists(scope + "/per_layer_token_scale");
+          if (!v) return nullptr;
+          return std::make_unique<StorageView>(v->to(DataType::FLOAT32).to(Device::CPU));
+        }())
+      , _per_layer_model_proj(build_optional_layer<Dense>(model, scope + "/per_layer_model_projection"))
+      , _per_layer_proj_norm(build_optional_layer<LayerNorm>(model, scope + "/per_layer_projection_norm")) {
 
       dim_t alignment_layer = (
         model.get_attribute_with_default<int32_t>(scope + "/alignment_layer", -1));
@@ -622,10 +721,18 @@ namespace ctranslate2 {
       if (_outputs_scale)
         ops::Mul()(layer_in, *_outputs_scale, layer_in);
 
-      if (return_logits)
+      if (return_logits) {
         _proj(layer_in, *outputs);
-      else
+        // Gemma 4: final logit soft-capping: tanh(x/cap)*cap
+        // Scalars must be CPU StorageViews (see CUDA scalar deref note in layer_scalar fix).
+        if (_final_logit_softcap > 0.f) {
+          ops::Mul()(*outputs, StorageView(1.f / _final_logit_softcap), *outputs);
+          ops::Tanh()(*outputs, *outputs);
+          ops::Mul()(*outputs, StorageView(_final_logit_softcap), *outputs);
+        }
+      } else {
         *outputs = std::move(layer_in);
+      }
 
       if (!is_sequence)
         outputs->squeeze(1);
@@ -745,6 +852,10 @@ namespace ctranslate2 {
 
       StorageView position_bias(dtype, device);
 
+      // Gemma 4 E-series: compute combined per-layer inputs from ids + layer_in.
+      const std::vector<StorageView> per_layer_embs =
+          _compute_per_layer_inputs(&ids, layer_in);
+
       std::vector<StorageView> layer_ins;
 
       while (true) {
@@ -769,12 +880,22 @@ namespace ctranslate2 {
           StorageView* cached_attn_keys = nullptr;
           StorageView* cached_attn_values = nullptr;
 
+          bool kv_read_only = false;
           if (step >= 0) {
-            const std::string l_str = std::to_string(l);
-            cached_self_attn_keys = &state.at("self_keys_" + l_str);
-            cached_self_attn_values = &state.at("self_values_" + l_str);
+            const dim_t src_idx = _layers[l]->kv_shared_layer_index();
+            if (src_idx >= 0) {
+              const std::string src_str = std::to_string(src_idx);
+              cached_self_attn_keys   = &state.at("self_keys_"   + src_str);
+              cached_self_attn_values = &state.at("self_values_" + src_str);
+              kv_read_only = true;
+            } else {
+              const std::string l_str = std::to_string(l);
+              cached_self_attn_keys   = &state.at("self_keys_"   + l_str);
+              cached_self_attn_values = &state.at("self_values_" + l_str);
+            }
             if (_with_encoder_attention) {
-              cached_attn_keys = &state.at("memory_keys_" + l_str);
+              const std::string l_str = std::to_string(l);
+              cached_attn_keys   = &state.at("memory_keys_"   + l_str);
               cached_attn_values = &state.at("memory_values_" + l_str);
             }
           }
@@ -806,6 +927,8 @@ namespace ctranslate2 {
             input_lengths_mask = std::make_unique<StorageView>(std::move(tmp_lengths));
           }
 
+          const StorageView* ple = !per_layer_embs.empty()
+                                   ? &per_layer_embs[l] : nullptr;
           (*_layers[l])(*layer_in_chunk,
                         input_lengths_mask.get(),
                         memory,
@@ -820,7 +943,9 @@ namespace ctranslate2 {
                         memory_padder.get(),
                         return_normalized_attention(),
                         &position_bias,
-                        offset);
+                        offset,
+                        ple,
+                        kv_read_only);
           *layer_in_chunk = std::move(layer_out);
 
           if (layer_attention) {
@@ -860,10 +985,10 @@ namespace ctranslate2 {
 
     // -----------------------------------------------------------------------
     // decode_from_embeds: like decode() but accepts pre-computed embeddings.
-    // Skips embedding lookup, embeddings_scale, and project_in.
-    // Used by VibeVoice-ASR to prefill the KV-cache with audio+text embeddings.
+    // input_ids (optional): used for Gemma 4 E-series token-side PLE lookup.
     // -----------------------------------------------------------------------
     void TransformerDecoder::decode_from_embeds(const StorageView& inputs_embeds,
+                                                const StorageView* input_ids,
                                                 const StorageView* lengths,
                                                 dim_t step,
                                                 DecoderState& state,
@@ -934,16 +1059,29 @@ namespace ctranslate2 {
       std::vector<StorageView> layer_ins;
       layer_ins.push_back(std::move(layer_in));
 
+      // Gemma 4 E-series: compute combined per-layer inputs.
+      const std::vector<StorageView> per_layer_embs =
+          _compute_per_layer_inputs(input_ids, inputs_embeds.to(dtype));
+
       for (size_t i = 0; i < layer_ins.size(); ++i) {
         StorageView* layer_in_chunk = &layer_ins[i];
         for (size_t l = 0; l < _layers.size(); ++l) {
           StorageView* cached_self_attn_keys = nullptr;
           StorageView* cached_self_attn_values = nullptr;
 
+          bool kv_read_only = false;
           if (step >= 0) {
-            const std::string l_str = std::to_string(l);
-            cached_self_attn_keys   = &state.at("self_keys_"   + l_str);
-            cached_self_attn_values = &state.at("self_values_" + l_str);
+            const dim_t src_idx = _layers[l]->kv_shared_layer_index();
+            if (src_idx >= 0) {
+              const std::string src_str = std::to_string(src_idx);
+              cached_self_attn_keys   = &state.at("self_keys_"   + src_str);
+              cached_self_attn_values = &state.at("self_values_" + src_str);
+              kv_read_only = true;
+            } else {
+              const std::string l_str = std::to_string(l);
+              cached_self_attn_keys   = &state.at("self_keys_"   + l_str);
+              cached_self_attn_values = &state.at("self_values_" + l_str);
+            }
           }
 
           std::unique_ptr<StorageView> heads_to_select = get_layer_alignment_heads(l, batch_size);
@@ -953,6 +1091,8 @@ namespace ctranslate2 {
 
           const dim_t offset = std::max(dim_t(0), dim_t(_sliding_window) * dim_t(i) + step);
 
+          const StorageView* ple = !per_layer_embs.empty()
+                                   ? &per_layer_embs[l] : nullptr;
           (*_layers[l])(*layer_in_chunk,
                         input_lengths_mask.get(),
                         /*memory=*/nullptr,
@@ -967,7 +1107,9 @@ namespace ctranslate2 {
                         /*memory_padder=*/nullptr,
                         return_normalized_attention(),
                         &position_bias,
-                        offset);
+                        offset,
+                        ple,
+                        kv_read_only);
           *layer_in_chunk = std::move(layer_out);
 
           if (layer_attention) {
@@ -981,6 +1123,145 @@ namespace ctranslate2 {
       // Always a sequence — is_sequence=true, input_padder may or may not be set.
       _apply_output_projection(layer_in, layer_out, outputs, return_logits,
                                /*is_sequence=*/true, input_padder.get());
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_from_embeds: backward-compatible overload (no input_ids).
+    // -----------------------------------------------------------------------
+    void TransformerDecoder::decode_from_embeds(const StorageView& inputs_embeds,
+                                                const StorageView* lengths,
+                                                dim_t step,
+                                                DecoderState& state,
+                                                StorageView* outputs,
+                                                StorageView* attention,
+                                                bool return_logits) {
+      decode_from_embeds(inputs_embeds, /*input_ids=*/nullptr,
+                         lengths, step, state, outputs, attention, return_logits);
+    }
+
+    // -----------------------------------------------------------------------
+    // _compute_per_layer_inputs: Gemma 4 E-series PLE computation.
+    //
+    // Computes the combined per-layer input tensor for all layers:
+    //   model_ple = per_layer_model_projection(inputs_embeds) * hidden_size^{-0.5}
+    //   model_ple = per_layer_projection_norm(model_ple)  [B, T, num_L, D]
+    //   token_ple = embed_tokens_per_layer[ids] * sqrt(D)  [B, T, num_L, D] (if ids)
+    //   combined  = (model_ple + token_ple) * 2^{-0.5}     (or just model_ple)
+    //
+    // Returns a vector of num_layers StorageViews, each [batch, seq, per_layer_dim].
+    // Returns empty vector if PLE weights are not loaded.
+    // -----------------------------------------------------------------------
+    std::vector<StorageView> TransformerDecoder::_compute_per_layer_inputs(
+        const StorageView* ids,
+        const StorageView& inputs_embeds) const {
+
+      if (!_per_layer_model_proj || !_per_layer_proj_norm)
+        return {};
+
+      const DataType dtype = output_type();
+      const Device device = inputs_embeds.device();
+      const dim_t B = inputs_embeds.dim(0);
+      const dim_t T = inputs_embeds.dim(1);
+      const dim_t H = inputs_embeds.dim(2);
+      const dim_t num_layers = static_cast<dim_t>(_layers.size());
+
+      // Step 1: model projection: [B, T, H] → [B, T, num_layers * per_layer_dim]
+      StorageView model_ple(dtype, device);
+      {
+        StorageView embeds_cast = inputs_embeds.to(dtype);
+        (*_per_layer_model_proj)(embeds_cast, model_ple);
+      }
+
+      // Scale by hidden_size^{-0.5}
+      {
+        const float scale = 1.0f / std::sqrt(static_cast<float>(H));
+        ops::Mul()(model_ple, StorageView(scale), model_ple);  // CPU scalar (CUDA safe)
+      }
+
+      const dim_t ple_total = model_ple.dim(2);
+      const dim_t per_layer_dim = ple_total / num_layers;
+
+      // Step 2: reshape to [B*T*num_layers, per_layer_dim] and apply norm.
+      model_ple.reshape({B * T * num_layers, per_layer_dim});
+      StorageView normed_ple(dtype, device);
+      (*_per_layer_proj_norm)(model_ple, normed_ple);
+      normed_ple.reshape({B, T, num_layers, per_layer_dim});
+
+      // Step 3: token PLE lookup (if ids and embedding table are available).
+      StorageView combined_ple(dtype, device);
+      if (ids && _per_layer_embeddings) {
+        const StorageView ids_cpu = ids->to(Device::CPU);
+        const bool is_seq = (ids_cpu.rank() == 2);
+        const dim_t n_ids = static_cast<dim_t>(ids_cpu.size());
+
+        StorageView flat_ids(ids_cpu);
+        flat_ids.reshape({n_ids});
+
+        StorageView token_ple_dev(dtype, device);
+        if (_per_layer_embeddings->dtype() == DataType::INT8) {
+          // Legacy INT8 path: gather + manual dequantize with per-row scale.
+          StorageView token_ple_int8(DataType::INT8, Device::CPU);
+          ops::Gather()(*_per_layer_embeddings, flat_ids, token_ple_int8);
+
+          StorageView scales_gathered(DataType::FLOAT32, Device::CPU);
+          ops::Gather()(*_per_layer_embedding_scales, flat_ids, scales_gathered);
+
+          const dim_t n_rows = static_cast<dim_t>(n_ids);
+          const dim_t n_cols = static_cast<dim_t>(token_ple_int8.dim(1));
+          StorageView token_ple_float(DataType::FLOAT32, Device::CPU);
+          token_ple_float.resize({n_rows, n_cols});
+
+          const int8_t* src_data   = token_ple_int8.data<int8_t>();
+          const float*  scale_data = scales_gathered.data<float>();
+          float*        dst_data   = token_ple_float.data<float>();
+          for (dim_t i = 0; i < n_rows; ++i) {
+            const float s = scale_data[i];
+            for (dim_t j = 0; j < n_cols; ++j)
+              dst_data[i * n_cols + j] = static_cast<float>(src_data[i * n_cols + j]) * s;
+          }
+          token_ple_dev = token_ple_float.to(device).to(dtype);
+        } else {
+          // Float16 path: gather directly then cast to compute dtype.
+          // The embedding table is stored as float16, matching HF's bfloat16→float16
+          // cast exactly — no quantization error.
+          StorageView token_ple_cpu(_per_layer_embeddings->dtype(), Device::CPU);
+          ops::Gather()(*_per_layer_embeddings, flat_ids, token_ple_cpu);
+          token_ple_dev = token_ple_cpu.to(device).to(dtype);
+        }
+
+        // Scale by sqrt(per_layer_dim)
+        {
+          const float embed_scale = std::sqrt(static_cast<float>(per_layer_dim));
+          ops::Mul()(token_ple_dev, StorageView(embed_scale), token_ple_dev);  // CPU scalar (CUDA safe)
+        }
+
+        // Reshape to [B, T, num_layers, per_layer_dim]
+        if (is_seq) {
+          token_ple_dev.reshape({B, T, num_layers, per_layer_dim});
+        } else {
+          token_ple_dev.reshape({B, 1, num_layers, per_layer_dim});
+        }
+
+        // Combine: (model_ple + token_ple) * 2^{-0.5}
+        StorageView added(dtype, device);
+        ops::Add()(normed_ple, token_ple_dev, added);
+        ops::Mul()(added, StorageView(0.70710678f), combined_ple);  // CPU scalar (CUDA safe)
+      } else {
+        combined_ple = std::move(normed_ple);
+      }
+
+      // Step 4: slice into per-layer tensors [B, T, per_layer_dim].
+      const dim_t T_actual = combined_ple.dim(1);
+      std::vector<StorageView> result(static_cast<size_t>(num_layers),
+                                      StorageView(dtype, device));
+      for (dim_t l = 0; l < num_layers; ++l) {
+        StorageView tmp(combined_ple);
+        tmp.reshape({B * T_actual, num_layers, per_layer_dim});
+        ops::Slide(1, l, 1)(tmp, result[static_cast<size_t>(l)]);
+        result[static_cast<size_t>(l)].reshape({B, T_actual, per_layer_dim});
+      }
+
+      return result;
     }
 
   }

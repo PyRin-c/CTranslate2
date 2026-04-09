@@ -4,6 +4,8 @@ and :class:`ctranslate2.Generator`.
 
 try:
     from ctranslate2._ext import (
+        Gemma4,
+        Gemma4GenerationResult,
         Parakeet,
         ParakeetResult,
         VibeVoiceAsr,

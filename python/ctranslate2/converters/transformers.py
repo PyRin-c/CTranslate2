@@ -20,6 +20,7 @@ from ctranslate2.converters.converter import Converter
 from ctranslate2.specs import (
     attention_spec,
     common_spec,
+    gemma4_spec,
     model_spec,
     transformer_spec,
     wav2vec2_spec,
@@ -2027,6 +2028,593 @@ class Gemma3Loader(ModelLoader):
             delattr(layer, "self_attn")
             delattr(layer, "mlp")
             gc.collect()
+
+
+@register_loader("Gemma4TextConfig")
+class Gemma4Loader(ModelLoader):
+    @property
+    def architecture_name(self):
+        return "Gemma4ForCausalLM"
+
+    def get_model_spec(self, model):
+        config = model.config
+
+        num_layers = config.num_hidden_layers
+        num_heads = config.num_attention_heads
+        num_heads_kv = getattr(config, "num_key_value_heads", num_heads)
+        if num_heads_kv == num_heads:
+            num_heads_kv = None
+
+        # Sliding (local) attention head dimension
+        head_dim = getattr(config, "head_dim", 256)
+        # Full (global) attention head dimension
+        global_head_dim = getattr(config, "global_head_dim", 512)
+
+        rope_theta = getattr(config, "rope_theta", 1_000_000)
+        rope_local_base_freq = getattr(config, "rope_local_base_freq", 10_000)
+        sliding_window = getattr(config, "sliding_window", 1024)
+        sliding_window_pattern = getattr(config, "sliding_window_pattern", 6)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.25)
+
+        # Determine per-layer type: global if layer_idx % pattern == 0
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types is None:
+            layer_types = [
+                "full_attention" if i % sliding_window_pattern == 0 else "sliding_attention"
+                for i in range(num_layers)
+            ]
+
+        activation_config = getattr(config, "hidden_activation", "gelu_pytorch_tanh")
+        activation = (
+            common_spec.Activation.GELU
+            if activation_config == "gelu"
+            else common_spec.Activation.GELUTanh
+        )
+
+        has_ple = getattr(config, "hidden_size_per_layer_input", 0) > 0
+        has_moe = getattr(config, "enable_moe_block", False)
+
+        # Build spec with local-attention defaults; global layers are overridden below.
+        spec = transformer_spec.TransformerDecoderModelSpec.from_config(
+            num_layers,
+            num_heads,
+            activation=activation,
+            pre_norm=True,
+            ffn_glu=True,
+            rms_norm=True,
+            rotary_dim=head_dim,
+            rotary_interleave=False,
+            rotary_base=rope_local_base_freq,
+            num_heads_kv=num_heads_kv,
+            head_dim=head_dim,
+            sliding_window=sliding_window,
+            pre_post_layer_norm=True,
+            qk_norm=True,
+            v_norm=True,  # Gemma4: scaleless RMSNorm applied to V in all layers
+            per_layer_input=has_ple,
+            has_moe=has_moe,
+        )
+
+        # Store for use in set_decoder
+        self._layer_types = layer_types
+        self._head_dim = head_dim
+        self._global_head_dim = global_head_dim
+        self._rope_theta = rope_theta
+        self._rope_local_base_freq = rope_local_base_freq
+        self._sliding_window = sliding_window
+        self._partial_rotary_factor = partial_rotary_factor
+        self._has_ple = has_ple
+        self._has_moe = has_moe
+        self._moe_top_k = getattr(config, "top_k_experts", 0) if has_moe else 0
+
+        # Gemma 4 KV Cache Sharing (E2B / E4B):
+        # Build a per-layer list of source indices (-1 = not a shared layer).
+        num_hidden_layers = config.num_hidden_layers
+        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+        first_kv_shared_idx = num_hidden_layers - num_kv_shared
+        kv_shared_indices = []
+        for l in range(num_hidden_layers):
+            if num_kv_shared > 0 and l >= first_kv_shared_idx:
+                # Find the last non-shared layer of the same type
+                my_type = layer_types[l]
+                prev_types = layer_types[:first_kv_shared_idx]
+                try:
+                    src_idx = len(prev_types) - 1 - prev_types[::-1].index(my_type)
+                except ValueError:
+                    src_idx = first_kv_shared_idx - 1
+                kv_shared_indices.append(src_idx)
+            else:
+                kv_shared_indices.append(-1)
+        self._kv_shared_indices = kv_shared_indices
+
+        # Override per-layer settings for global (full attention) layers.
+        for i, layer_type in enumerate(layer_types):
+            layer = spec.decoder.layer[i]
+            if layer_type == "full_attention":
+                # Global layers: separate Q, K, V projections (K ≠ V), larger head_dim.
+                layer.self_attention = attention_spec.MultiHeadAttentionSpec(
+                    self_attention=True,
+                    rms_norm=True,
+                    has_norm=False,  # norms live outside the attention block (pre-post-norm)
+                    rotary_dim=global_head_dim,
+                    rotary_interleave=False,
+                    rotary_base=rope_theta,
+                    rotary_scaling_type=attention_spec.RotaryScalingType.Proportional,
+                    num_heads_kv=num_heads_kv,
+                    head_dim=global_head_dim,
+                    sliding_window=0,
+                    qk_norm=True,
+                    v_norm=True,  # scaleless RMSNorm applied to V
+                )
+                layer.self_attention.rotary_partial_rotary_factor = np.dtype("float32").type(
+                    partial_rotary_factor
+                )
+            else:
+                layer.self_attention.rotary_base = np.dtype("float32").type(rope_local_base_freq)
+                layer.self_attention.sliding_window = np.dtype("int32").type(sliding_window)
+
+        # Set logit soft-capping
+        final_logit_softcapping = getattr(config, "final_logit_softcapping", 0.0)
+        if final_logit_softcapping:
+            spec.decoder.final_logit_softcap = np.dtype("float32").type(
+                final_logit_softcapping
+            )
+
+        self.set_decoder(spec.decoder, model.model)
+        self.set_linear(spec.decoder.projection, model.lm_head)
+        return spec
+
+    def get_vocabulary(self, model, tokenizer):
+        tokens = super().get_vocabulary(model, tokenizer)
+        extra_ids = model.config.vocab_size - len(tokens)
+        for i in range(extra_ids):
+            tokens.append("<extra_id_%d>" % i)
+        if model.config.vocab_size < len(tokens):
+            tokens = tokens[: model.config.vocab_size]
+        return tokens
+
+    def set_vocabulary(self, spec, tokens):
+        spec.register_vocabulary(tokens)
+
+    def set_config(self, config, model, tokenizer):
+        config.bos_token = tokenizer.bos_token
+        config.unk_token = tokenizer.unk_token
+        if (
+            hasattr(tokenizer, "chat_template")
+            and isinstance(tokenizer.chat_template, str)
+            and tokenizer.chat_template.strip()
+        ):
+            config.eos_token = "<end_of_turn>"
+        else:
+            config.eos_token = tokenizer.eos_token
+
+    def set_layer_norm(self, spec, layer_norm):
+        spec.gamma = layer_norm.weight
+        # Gemma4 RMSNorm: output = x/rms * weight  (direct multiplication, no +1 residual).
+        # Gemma1/2/3 used (1+weight) with zero-initialized weights; Gemma4 uses weight
+        # initialized to 1.0 with direct multiplication. CT2 default is False (direct mult).
+
+    def set_decoder(self, spec, module):
+        spec.scale_embeddings = True
+        spec.start_from_zero_embedding = False
+        self.set_embeddings(spec.embeddings, module.embed_tokens)
+        self.set_layer_norm(spec.layer_norm, module.norm)
+
+        # Per-layer model embedding table (PLE) — Gemma 4 E-series
+        # HF attribute: embed_tokens_per_layer (not per_layer_model_embedding)
+        if self._has_ple and hasattr(module, "embed_tokens_per_layer"):
+            # The table is [vocab_size, num_layers * per_layer_dim] = [262144, 8960].
+            # Store as float16 to match the HF bfloat16→float16 cast path exactly,
+            # avoiding the INT8 quantization error that previously caused precision divergence.
+            # float16 size: ~4.7 GB — acceptable given model.bin has no hard 4 GB limit.
+            ple_weight = module.embed_tokens_per_layer.weight.detach().half().numpy()
+            spec.per_layer_token_embedding = ple_weight                  # [vocab, 8960] float16
+            # per_layer_token_scale is intentionally omitted (INT8 path only)
+            del ple_weight
+            self.set_linear(spec.per_layer_model_projection, module.per_layer_model_projection)
+            self.set_layer_norm(spec.per_layer_projection_norm, module.per_layer_projection_norm)
+
+        for i, (layer_spec, layer) in enumerate(zip(spec.layer, module.layers)):
+            layer_type = self._layer_types[i]
+            is_global = layer_type == "full_attention"
+
+            # Layer norms
+            self.set_layer_norm(layer_spec.input_layer_norm, layer.input_layernorm)
+            self.set_layer_norm(
+                layer_spec.post_attention_layer_norm, layer.post_attention_layernorm
+            )
+            self.set_layer_norm(
+                layer_spec.pre_feedforward_layer_norm, layer.pre_feedforward_layernorm
+            )
+            self.set_layer_norm(
+                layer_spec.post_feedforward_layer_norm, layer.post_feedforward_layernorm
+            )
+
+            # Gemma 4: attention scaling = 1.0 (not 1/sqrt(d_head)).
+            # HF sets self.scaling = 1.0 because QK-norm controls vector magnitudes.
+            layer_spec.self_attention.queries_scale = np.dtype("float32").type(1.0)
+
+            # QK norms
+            self.set_layer_norm(layer_spec.self_attention.q_norm, layer.self_attn.q_norm)
+            self.set_layer_norm(layer_spec.self_attention.k_norm, layer.self_attn.k_norm)
+
+            # Fuse Q+K+V for all layer types (global and local both have separate V).
+            split_layers = [
+                common_spec.LinearSpec(),
+                common_spec.LinearSpec(),
+                common_spec.LinearSpec(),
+            ]
+            self.set_linear(split_layers[0], layer.self_attn.q_proj)
+            self.set_linear(split_layers[1], layer.self_attn.k_proj)
+            self.set_linear(split_layers[2], layer.self_attn.v_proj)
+            utils.fuse_linear(layer_spec.self_attention.linear[0], split_layers)
+
+            # v_norm is scaleless (gamma=ones) for all layers.
+            if hasattr(layer_spec.self_attention, "v_norm"):
+                v_out = layer.self_attn.v_proj.out_features
+                layer_spec.self_attention.v_norm.gamma = np.ones(v_out, dtype=np.float32)
+
+            self.set_linear(layer_spec.self_attention.linear[1], layer.self_attn.o_proj)
+
+            # FFN
+            self.set_linear(layer_spec.ffn.linear_0, layer.mlp.gate_proj)
+            self.set_linear(layer_spec.ffn.linear_0_noact, layer.mlp.up_proj)
+            self.set_linear(layer_spec.ffn.linear_1, layer.mlp.down_proj)
+
+            # Gemma 4 MoE: parallel dense + sparse MoE FFN
+            if self._has_moe and hasattr(layer, "router"):
+                hidden_size = layer.router.hidden_size
+                # Router: scaleless RMSNorm (gamma=ones, no learnable weight)
+                layer_spec.router_norm.gamma = np.ones(hidden_size, dtype=np.float32)
+                # Router scale and projection
+                layer_spec.router_scale = (
+                    layer.router.scale.detach().float().numpy()
+                )
+                layer_spec.router_proj.weight = (
+                    layer.router.proj.weight.detach().float().numpy()
+                )
+                layer_spec.router_per_expert_scale = (
+                    layer.router.per_expert_scale.detach().float().numpy()
+                )
+                # Expert weights: convert one at a time to avoid peak-memory doubling.
+                # gate_up_proj: [E, 2*I, H], down_proj: [E, H, I]
+                t = layer.experts.gate_up_proj
+                layer_spec.experts_gate_up_proj = t.detach().float().numpy()
+                del t
+                t = layer.experts.down_proj
+                layer_spec.experts_down_proj = t.detach().float().numpy()
+                del t
+                # MoE top-k (int32 scalar)
+                layer_spec.moe_top_k = np.dtype("int32").type(self._moe_top_k)
+                # Extra layer norms for MoE path
+                self.set_layer_norm(
+                    layer_spec.post_feedforward_layernorm_1,
+                    layer.post_feedforward_layernorm_1,
+                )
+                self.set_layer_norm(
+                    layer_spec.pre_feedforward_layernorm_2,
+                    layer.pre_feedforward_layernorm_2,
+                )
+                self.set_layer_norm(
+                    layer_spec.post_feedforward_layernorm_2,
+                    layer.post_feedforward_layernorm_2,
+                )
+                # Free router and expert tensors immediately after converting.
+                delattr(layer, "router")
+                delattr(layer, "experts")
+                gc.collect()
+
+            # Per-Layer Embeddings (PLE)
+            if self._has_ple and hasattr(layer, "per_layer_input_gate"):
+                self.set_linear(layer_spec.per_layer_input_gate, layer.per_layer_input_gate)
+                self.set_linear(layer_spec.per_layer_projection, layer.per_layer_projection)
+                self.set_layer_norm(
+                    layer_spec.post_per_layer_input_norm, layer.post_per_layer_input_norm
+                )
+
+            # Layer scalar (per-layer learnable/buffer scalar, default 1.0)
+            if hasattr(layer, "layer_scalar"):
+                layer_spec.layer_scalar = layer.layer_scalar.item()
+
+            # Gemma 4 KV Cache Sharing: record source layer index for shared layers
+            src_idx = self._kv_shared_indices[i]
+            if src_idx >= 0:
+                layer_spec.kv_shared_layer_index = np.dtype("int32").type(src_idx)
+
+            delattr(layer, "self_attn")
+            delattr(layer, "mlp")
+            gc.collect()
+
+
+@register_loader("Gemma4Config")  # multimodal variant — takes priority over the CausalLM loader
+class Gemma4MultimodalLoader(Gemma4Loader):
+    """Converts Gemma4ForConditionalGeneration (text + vision encoder) to CT2 format.
+
+    Extends Gemma4Loader to also convert:
+      - SigLIP vision encoder (patch embedder + transformer layers + 2D RoPE tables)
+      - Multimodal embedder (scaleless RMSNorm + projection)
+
+    The resulting model is saved as Gemma4Spec which bundles vision_encoder,
+    multimodal_embedder, and the standard decoder.
+    """
+
+    @property
+    def architecture_name(self):
+        return "Gemma4ForConditionalGeneration"
+
+    def get_vocabulary(self, model, tokenizer):
+        # For Gemma4ForConditionalGeneration, vocab_size lives in text_config
+        # (the top-level Gemma4Config does not expose vocab_size directly).
+        tokens = ModelLoader.get_vocabulary(self, model, tokenizer)
+        vocab_size = model.config.text_config.vocab_size
+        extra_ids = vocab_size - len(tokens)
+        for i in range(extra_ids):
+            tokens.append("<extra_id_%d>" % i)
+        if vocab_size < len(tokens):
+            tokens = tokens[:vocab_size]
+        return tokens
+
+    def set_config(self, config, model, tokenizer):
+        super().set_config(config, model, tokenizer)
+        # Store image_token_id so the C++ generate() can default to the correct
+        # placeholder token without requiring the caller to look it up manually.
+        image_token_id = getattr(model.config, "image_token_id", None)
+        if image_token_id is not None:
+            config.add_attribute("image_token_id", image_token_id)
+
+    @staticmethod
+    def _compute_vision_rope_tables(inv_freq, max_positions, attention_scaling=1.0):
+        """Precompute 2D RoPE cosine/sine tables for integer positions 0..max_positions-1.
+
+        Args:
+          inv_freq: np.ndarray of shape [spatial_dim // 2] (inv_freq from Gemma4VisionRotaryEmbedding).
+          max_positions: Number of distinct position IDs to cover (e.g. position_embedding_size).
+          attention_scaling: Scalar multiplier applied after cos/sin (from the rotary embedding).
+
+        Returns:
+          (cos_table, sin_table), each of shape [max_positions, spatial_dim]
+          where spatial_dim = head_dim // 2 = 2 * len(inv_freq).
+        """
+        positions = np.arange(max_positions, dtype=np.float32)          # [max_positions]
+        freqs = np.outer(positions, inv_freq)                            # [max_positions, inv_freq_len]
+        emb = np.concatenate([freqs, freqs], axis=-1)                   # [max_positions, spatial_dim]
+        cos_table = (np.cos(emb) * attention_scaling).astype(np.float32)
+        sin_table = (np.sin(emb) * attention_scaling).astype(np.float32)
+        return cos_table, sin_table
+
+    def _set_vision_encoder(self, spec, vision_model):
+        """Fill in Gemma4VisionEncoderSpec from a Gemma4VisionModel instance."""
+        patch_embedder = vision_model.patch_embedder
+        encoder = vision_model.encoder
+
+        # --- Patch embedder ---
+        spec.patch_embedder.input_proj.weight = (
+            patch_embedder.input_proj.weight.detach().float().numpy()
+        )
+        spec.patch_embedder.position_embedding_table = (
+            patch_embedder.position_embedding_table.detach().float().numpy()
+        )
+
+        # --- Precomputed 2D RoPE tables ---
+        inv_freq = encoder.rotary_emb.inv_freq.detach().float().numpy()
+        attention_scaling = float(encoder.rotary_emb.attention_scaling)
+        max_positions = patch_embedder.position_embedding_size
+        cos_table, sin_table = self._compute_vision_rope_tables(
+            inv_freq, max_positions, attention_scaling
+        )
+        spec.rope_cos = cos_table
+        spec.rope_sin = sin_table
+
+        # --- Encoder layers ---
+        for layer_spec, layer in zip(spec.layer, encoder.layers):
+            # External layer norms
+            layer_spec.input_layer_norm.gamma = (
+                layer.input_layernorm.weight.detach().float().numpy()
+            )
+            layer_spec.post_attention_layer_norm.gamma = (
+                layer.post_attention_layernorm.weight.detach().float().numpy()
+            )
+            layer_spec.pre_feedforward_layer_norm.gamma = (
+                layer.pre_feedforward_layernorm.weight.detach().float().numpy()
+            )
+            layer_spec.post_feedforward_layer_norm.gamma = (
+                layer.post_feedforward_layernorm.weight.detach().float().numpy()
+            )
+
+            # Self-attention: q_norm and k_norm (with learnable scale)
+            layer_spec.self_attention.q_norm.gamma = (
+                layer.self_attn.q_norm.weight.detach().float().numpy()
+            )
+            layer_spec.self_attention.k_norm.gamma = (
+                layer.self_attn.k_norm.weight.detach().float().numpy()
+            )
+            # v_norm is scaleless (with_scale=False) → store gamma as ones
+            head_dim = layer.self_attn.head_dim
+            layer_spec.self_attention.v_norm.gamma = np.ones(head_dim, dtype=np.float32)
+
+            # Fuse Q, K, V projections into CT2 linear[0] (self_attention=True layout)
+            split_layers = [
+                common_spec.LinearSpec(),
+                common_spec.LinearSpec(),
+                common_spec.LinearSpec(),
+            ]
+            # Gemma4ClippableLinear stores the actual weight in .linear
+            split_layers[0].weight = (
+                layer.self_attn.q_proj.linear.weight.detach().float().numpy()
+            )
+            split_layers[1].weight = (
+                layer.self_attn.k_proj.linear.weight.detach().float().numpy()
+            )
+            split_layers[2].weight = (
+                layer.self_attn.v_proj.linear.weight.detach().float().numpy()
+            )
+            utils.fuse_linear(layer_spec.self_attention.linear[0], split_layers)
+
+            # Output projection
+            layer_spec.self_attention.linear[1].weight = (
+                layer.self_attn.o_proj.linear.weight.detach().float().numpy()
+            )
+
+            # FFN (GeGLU): gate_proj, up_proj, down_proj
+            layer_spec.ffn.linear_0.weight = (
+                layer.mlp.gate_proj.linear.weight.detach().float().numpy()
+            )
+            layer_spec.ffn.linear_0_noact.weight = (
+                layer.mlp.up_proj.linear.weight.detach().float().numpy()
+            )
+            layer_spec.ffn.linear_1.weight = (
+                layer.mlp.down_proj.linear.weight.detach().float().numpy()
+            )
+
+            delattr(layer, "self_attn")
+            delattr(layer, "mlp")
+            gc.collect()
+
+    def _set_multimodal_embedder(self, spec, embed_vision):
+        """Fill in Gemma4MultimodalEmbedderSpec from a Gemma4MultimodalEmbedder."""
+        # Scaleless RMSNorm: embedding_pre_projection_norm has no learnable weight
+        hidden_size = embed_vision.multimodal_hidden_size
+        spec.pre_projection_norm.gamma = np.ones(hidden_size, dtype=np.float32)
+        # Linear projection
+        spec.projection.weight = (
+            embed_vision.embedding_projection.weight.detach().float().numpy()
+        )
+
+    def get_model_spec(self, model):
+        text_config = model.config.text_config
+        vision_config = model.config.vision_config
+
+        # --- Text decoder parameters (identical to Gemma4Loader) ---
+        num_layers = text_config.num_hidden_layers
+        num_heads = text_config.num_attention_heads
+        num_heads_kv = getattr(text_config, "num_key_value_heads", num_heads)
+        if num_heads_kv == num_heads:
+            num_heads_kv = None
+
+        head_dim = getattr(text_config, "head_dim", 256)
+        global_head_dim = getattr(text_config, "global_head_dim", 512)
+        rope_theta = getattr(text_config, "rope_theta", 1_000_000)
+        rope_local_base_freq = getattr(text_config, "rope_local_base_freq", 10_000)
+        sliding_window = getattr(text_config, "sliding_window", 1024)
+        sliding_window_pattern = getattr(text_config, "sliding_window_pattern", 6)
+        partial_rotary_factor = getattr(text_config, "partial_rotary_factor", 0.25)
+
+        layer_types = getattr(text_config, "layer_types", None)
+        if layer_types is None:
+            layer_types = [
+                "full_attention" if i % sliding_window_pattern == 0 else "sliding_attention"
+                for i in range(num_layers)
+            ]
+
+        activation_config = getattr(text_config, "hidden_activation", "gelu_pytorch_tanh")
+        activation = (
+            common_spec.Activation.GELU
+            if activation_config == "gelu"
+            else common_spec.Activation.GELUTanh
+        )
+
+        has_ple = getattr(text_config, "hidden_size_per_layer_input", 0) > 0
+        has_moe = getattr(text_config, "enable_moe_block", False)
+
+        # --- Vision encoder parameters ---
+        num_vision_layers = vision_config.num_hidden_layers
+        num_vision_heads = vision_config.num_attention_heads
+        vision_head_dim = getattr(vision_config, "head_dim", 64)
+        sliding_window_for_decoder = sliding_window
+
+        # --- Build Gemma4Spec ---
+        spec = gemma4_spec.Gemma4Spec(
+            num_vision_layers=num_vision_layers,
+            num_vision_heads=num_vision_heads,
+            vision_head_dim=vision_head_dim,
+            num_decoder_layers=num_layers,
+            num_decoder_heads=num_heads,
+            num_decoder_kv_heads=num_heads_kv if num_heads_kv is not None else num_heads,
+            decoder_head_dim=head_dim,
+            sliding_window=sliding_window_for_decoder,
+            has_moe=has_moe,
+            per_layer_input=has_ple,
+        )
+
+        # Store shared state used by Gemma4Loader.set_decoder
+        self._layer_types = layer_types
+        self._head_dim = head_dim
+        self._global_head_dim = global_head_dim
+        self._rope_theta = rope_theta
+        self._rope_local_base_freq = rope_local_base_freq
+        self._sliding_window = sliding_window
+        self._partial_rotary_factor = partial_rotary_factor
+        self._has_ple = has_ple
+        self._has_moe = has_moe
+        self._moe_top_k = getattr(text_config, "top_k_experts", 0) if has_moe else 0
+
+        # KV cache sharing
+        num_kv_shared = getattr(text_config, "num_kv_shared_layers", 0)
+        first_kv_shared_idx = num_layers - num_kv_shared
+        kv_shared_indices = []
+        for l in range(num_layers):
+            if num_kv_shared > 0 and l >= first_kv_shared_idx:
+                my_type = layer_types[l]
+                prev_types = layer_types[:first_kv_shared_idx]
+                try:
+                    src_idx = len(prev_types) - 1 - prev_types[::-1].index(my_type)
+                except ValueError:
+                    src_idx = first_kv_shared_idx - 1
+                kv_shared_indices.append(src_idx)
+            else:
+                kv_shared_indices.append(-1)
+        self._kv_shared_indices = kv_shared_indices
+
+        # Override per-layer self_attention specs for global layers.
+        # Local layers already have v_norm from Gemma4Spec(v_norm=True); only global layers
+        # need to be replaced since their head_dim/RoPE differ from the defaults.
+        for i, layer_type in enumerate(layer_types):
+            layer = spec.decoder.layer[i]
+            if layer_type == "full_attention":
+                # Global layers: separate Q, K, V projections (K ≠ V), larger head_dim.
+                layer.self_attention = attention_spec.MultiHeadAttentionSpec(
+                    self_attention=True,
+                    rms_norm=True,
+                    has_norm=False,  # norms live outside the attention block (pre-post-norm)
+                    rotary_dim=global_head_dim,
+                    rotary_interleave=False,
+                    rotary_base=rope_theta,
+                    rotary_scaling_type=attention_spec.RotaryScalingType.Proportional,
+                    num_heads_kv=num_heads_kv,
+                    head_dim=global_head_dim,
+                    sliding_window=0,
+                    qk_norm=True,
+                    v_norm=True,  # scaleless RMSNorm applied to V
+                )
+                layer.self_attention.rotary_partial_rotary_factor = np.dtype("float32").type(
+                    partial_rotary_factor
+                )
+            else:
+                layer.self_attention.rotary_base = np.dtype("float32").type(rope_local_base_freq)
+                layer.self_attention.sliding_window = np.dtype("int32").type(sliding_window)
+
+        # Logit soft-capping
+        final_logit_softcapping = getattr(text_config, "final_logit_softcapping", 0.0)
+        if final_logit_softcapping:
+            spec.decoder.final_logit_softcap = np.dtype("float32").type(final_logit_softcapping)
+
+        # Fill weights — free each sub-module immediately after conversion to
+        # reduce peak memory usage on large MoE models.
+        self._set_vision_encoder(spec.vision_encoder, model.model.vision_tower)
+        del model.model.vision_tower
+        gc.collect()
+
+        self._set_multimodal_embedder(spec.multimodal_embedder, model.model.embed_vision)
+        del model.model.embed_vision
+        gc.collect()
+
+        # set_decoder (from Gemma4Loader) expects a Gemma4TextModel-compatible module
+        self.set_decoder(spec.decoder, model.model.language_model)
+        self.set_linear(spec.decoder.projection, model.lm_head)
+        del model.model.language_model, model.lm_head
+        gc.collect()
+
+        return spec
 
 
 @register_loader("MistralConfig")
